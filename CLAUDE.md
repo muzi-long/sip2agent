@@ -29,11 +29,11 @@ SIP2AGENT_QWEN_LIVE=1 SIP2AGENT_LIVE_DIR=<wav目录> QWEN_URL=wss://... DASHSCOP
 | `src/sip.rs` | rsipstack UAS:INVITE/ACK/BYE/CANCEL、`sip.allow` 来源检查(403)、404/488/503、re-INVITE/UPDATE 回当前 SDP、状态循环、停机 BYE |
 | `src/acl.rs` | `sip.allow` 的 IP/CIDR 解析与匹配(自写,不引依赖) |
 | `src/sdp.rs` | offer 解析(按 offer 顺序取首个 PCMA/PCMU)、answer 生成 |
-| `src/rtp.rs` | RTP 包、端口分配、对称 RTP、收包重组 160 样本帧、`MediaPort` |
+| `src/rtp.rs` | RTP 包、端口分配、对称 RTP 来源锁定(`Latch`:SDP 地址优先、锁定后丢弃其他来源、静默 1 s + 新来源连续 5 包才切换、re-INVITE 换地址重置)、收包重组 160 样本帧、`MediaPort` |
 | `src/audio/g711.rs` / `resample.rs` | G.711;rustpbx 原样移植的线性重采样(勿改算法,保留署名头) |
 | `src/call.rs` | 单通媒体编排、RTP 超时看门狗、echo agent |
 | `src/realtime/mod.rs` | `RealtimeProtocol` trait(含 `take_uplink` 协议回应、`hold_uplink` 暂停上行)、`DownlinkEvent` |
-| `src/realtime/bridge.rs` | 20 ms 节拍主循环:上行每拍必发一帧(无 RTP 发静音;`hold_uplink` 时本地暂存、解除后 100 ms 一块补发)、播放缓冲、打断、工具、转写、优雅关闭 |
+| `src/realtime/bridge.rs` | 20 ms 节拍主循环:上行每拍必发一帧(无 RTP 发静音;`hold_uplink` 时本地暂存、解除后 100 ms 一块补发)、播放缓冲(上限 60 s,丢最旧)、打断、工具、转写、WS 保活(5 s Ping / 15 s 无帧 → `ws_timeout`)、优雅关闭 |
 | `src/realtime/{doubao,qwen_omni,pcm_ws}.rs` | 适配器:编解码 + 协议状态机(无 IO / 计时),单测覆盖官方 / 实测事件样例 |
 | `src/webhook.rs` | 工具 webhook、通话结束 webhook |
 | `src/uac.rs` | 测试 UAC(examples / tests 共用):音调或按时间点播 wav 片段、录下行、wav 读写 |

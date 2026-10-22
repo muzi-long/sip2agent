@@ -37,8 +37,13 @@ pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub const CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 /// After an endpoint `hangup`, wait at most this long for playout to drain.
 pub const HANGUP_DRAIN_MAX: Duration = Duration::from_secs(10);
-/// Upper bound on buffered model audio (8 kHz samples): 10 minutes.
-const PLAYOUT_MAX_SAMPLES: usize = SIP_RATE as usize * 600;
+/// Upper bound on buffered model audio (8 kHz samples): 60 s. On overflow
+/// the oldest audio is dropped.
+const PLAYOUT_MAX_SAMPLES: usize = SIP_RATE as usize * 60;
+/// Send a WebSocket Ping this often.
+pub const PING_INTERVAL: Duration = Duration::from_secs(5);
+/// No inbound WebSocket frame (incl. Pong) for this long → dead connection.
+pub const DEAD_AFTER: Duration = Duration::from_secs(15);
 /// Uplink jitter cap: older frames beyond this backlog are dropped.
 const UPLINK_MAX_BACKLOG: usize = 5;
 /// Caller audio held while the adapter asks to (e.g. Qwen's greeting): 30 s.
@@ -57,6 +62,8 @@ pub enum BridgeEnd {
     WsClosed,
     /// Transport error on the WebSocket.
     WsError(String),
+    /// Nothing received from the vendor (not even a Pong) for [`DEAD_AFTER`].
+    WsTimeout,
     /// Vendor reported a fatal error event.
     VendorError(String),
     /// Session never became ready.
@@ -71,6 +78,7 @@ impl BridgeEnd {
             BridgeEnd::AgentHangup => "agent_hangup",
             BridgeEnd::WsClosed => "ws_closed",
             BridgeEnd::WsError(_) => "ws_error",
+            BridgeEnd::WsTimeout => "ws_timeout",
             BridgeEnd::VendorError(_) => "vendor_error",
             BridgeEnd::ReadyTimeout => "session_ready_timeout",
         }
@@ -196,13 +204,68 @@ impl Transcripts {
     }
 }
 
+/// Append resampled model audio to the playout buffer, dropping the oldest
+/// audio beyond [`PLAYOUT_MAX_SAMPLES`] (warns once per call).
+fn push_playout(playout: &mut VecDeque<i16>, pcm: Vec<i16>, warned: &mut bool) {
+    playout.extend(pcm);
+    if playout.len() > PLAYOUT_MAX_SAMPLES {
+        let excess = playout.len() - PLAYOUT_MAX_SAMPLES;
+        playout.drain(..excess);
+        if !*warned {
+            *warned = true;
+            warn!(
+                dropped_ms = excess * 1000 / SIP_RATE as usize,
+                "realtime: playout buffer full, dropping oldest model audio"
+            );
+        }
+    }
+}
+
+/// WebSocket keepalive timing.
+#[derive(Debug, Clone, Copy)]
+pub struct Keepalive {
+    pub ping_interval: Duration,
+    pub dead_after: Duration,
+}
+
+impl Default for Keepalive {
+    fn default() -> Self {
+        Self {
+            ping_interval: PING_INTERVAL,
+            dead_after: DEAD_AFTER,
+        }
+    }
+}
+
 /// Run the bridge until cancelled or the vendor ends the session.
 pub async fn run_bridge(
+    protocol: Box<dyn RealtimeProtocol>,
+    ws: WsStream,
+    media: MediaPort,
+    tools: ToolDispatcher,
+    ready_timeout: Duration,
+    cancel: CancellationToken,
+) -> BridgeResult {
+    run_bridge_with_keepalive(
+        protocol,
+        ws,
+        media,
+        tools,
+        ready_timeout,
+        Keepalive::default(),
+        cancel,
+    )
+    .await
+}
+
+/// [`run_bridge`] with explicit keepalive timing (tests use short intervals).
+pub async fn run_bridge_with_keepalive(
     mut protocol: Box<dyn RealtimeProtocol>,
     ws: WsStream,
     mut media: MediaPort,
     tools: ToolDispatcher,
     ready_timeout: Duration,
+    keepalive: Keepalive,
     cancel: CancellationToken,
 ) -> BridgeResult {
     let (mut ws_tx, mut ws_rx) = ws.split();
@@ -213,6 +276,7 @@ pub async fn run_bridge(
         assistant_buf: String::new(),
     };
     let mut playout: VecDeque<i16> = VecDeque::new();
+    let mut playout_warned = false;
     let mut up_buf: Vec<i16> = Vec::with_capacity(frame_samples(in_rate));
     let mut held: VecDeque<i16> = VecDeque::new();
     let held_max = in_rate as usize * HELD_MAX_MS / 1000;
@@ -243,6 +307,12 @@ pub async fn run_bridge(
 
     let mut ticker = tokio::time::interval(Duration::from_millis(FRAME_MS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
+    let mut pinger = tokio::time::interval_at(
+        Instant::now() + keepalive.ping_interval,
+        keepalive.ping_interval,
+    );
+    pinger.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last_inbound = Instant::now();
 
     let end = 'run: loop {
         tokio::select! {
@@ -250,6 +320,10 @@ pub async fn run_bridge(
             _ = cancel.cancelled() => break 'run BridgeEnd::Cancelled,
 
             _ = ticker.tick() => {
+                if last_inbound.elapsed() >= keepalive.dead_after {
+                    warn!(provider = protocol.name(), silent_for = ?last_inbound.elapsed(), "realtime: no frames from vendor, connection presumed dead");
+                    break 'run BridgeEnd::WsTimeout;
+                }
                 // ── uplink: exactly one frame per tick ──
                 let mut frame = media.uplink.try_recv().ok();
                 while media.uplink.len() > UPLINK_MAX_BACKLOG {
@@ -307,6 +381,9 @@ pub async fn run_bridge(
                     Some(Err(e)) => break 'run BridgeEnd::WsError(e.to_string()),
                     Some(Ok(m)) => m,
                 };
+                // Any frame (incl. Pong; tungstenite answers server Pings
+                // itself on our next write) proves the connection is alive.
+                last_inbound = Instant::now();
                 let events = match &msg {
                     Message::Text(t) => protocol.decode_text(t),
                     Message::Binary(b) => protocol.decode_binary(b),
@@ -338,10 +415,7 @@ pub async fn run_bridge(
                                 continue;
                             }
                             response_active = true;
-                            let pcm8 = down.push(&pcm);
-                            if playout.len() + pcm8.len() <= PLAYOUT_MAX_SAMPLES {
-                                playout.extend(pcm8);
-                            }
+                            push_playout(&mut playout, down.push(&pcm), &mut playout_warned);
                         }
                         DownlinkEvent::ResponseStarted => {
                             suppress_audio = false;
@@ -391,6 +465,12 @@ pub async fn run_bridge(
                             }
                         }
                     }
+                }
+            }
+
+            _ = pinger.tick() => {
+                if let Err(e) = ws_tx.send(Message::Ping(Vec::new().into())).await {
+                    break 'run BridgeEnd::WsError(e.to_string());
                 }
             }
 
@@ -470,5 +550,26 @@ mod tests {
     fn end_reasons() {
         assert_eq!(BridgeEnd::WsClosed.reason(), "ws_closed");
         assert_eq!(BridgeEnd::AgentHangup.reason(), "agent_hangup");
+        assert_eq!(BridgeEnd::WsTimeout.reason(), "ws_timeout");
+    }
+
+    #[test]
+    fn playout_cap_drops_oldest_and_warns_once() {
+        let mut p = VecDeque::new();
+        let mut warned = false;
+        push_playout(&mut p, vec![1; PLAYOUT_MAX_SAMPLES - 10], &mut warned);
+        assert!(!warned);
+        push_playout(&mut p, vec![2; 30], &mut warned);
+        assert!(warned);
+        assert_eq!(p.len(), PLAYOUT_MAX_SAMPLES);
+        // The 20 oldest samples were dropped; the newest audio is all kept.
+        assert_eq!(
+            p.iter().filter(|&&s| s == 1).count(),
+            PLAYOUT_MAX_SAMPLES - 30
+        );
+        assert_eq!(p.iter().rev().take(30).filter(|&&s| s == 2).count(), 30);
+        push_playout(&mut p, vec![3; 5], &mut warned);
+        assert_eq!(p.len(), PLAYOUT_MAX_SAMPLES);
+        assert_eq!(p.back(), Some(&3));
     }
 }

@@ -8,7 +8,9 @@ use base64::Engine as _;
 use common::*;
 use serde_json::{Value, json};
 use sip2agent::config::Config;
-use sip2agent::realtime::bridge::{BridgeEnd, BridgeResult, connect, run_bridge};
+use sip2agent::realtime::bridge::{
+    BridgeEnd, BridgeResult, Keepalive, connect, run_bridge_with_keepalive,
+};
 use sip2agent::realtime::protocol_for;
 use sip2agent::rtp::MediaPort;
 use sip2agent::webhook::ToolDispatcher;
@@ -34,6 +36,10 @@ struct Harness {
 }
 
 async fn start_bridge(config: &str, call_id: &str) -> Harness {
+    start_bridge_with(config, call_id, Keepalive::default()).await
+}
+
+async fn start_bridge_with(config: &str, call_id: &str, keepalive: Keepalive) -> Harness {
     sip2agent::install_crypto_provider();
     let cfg = Config::parse(config).unwrap();
     let agent = cfg.agents[0].clone();
@@ -52,7 +58,7 @@ async fn start_bridge(config: &str, call_id: &str) -> Harness {
     );
     let c = cancel.clone();
     let task = tokio::spawn(async move {
-        run_bridge(
+        run_bridge_with_keepalive(
             protocol,
             ws,
             MediaPort {
@@ -61,6 +67,7 @@ async fn start_bridge(config: &str, call_id: &str) -> Harness {
             },
             tools,
             Duration::from_millis(agent.timeout_ms),
+            keepalive,
             c,
         )
         .await
@@ -583,4 +590,66 @@ async fn tool_dispatcher_errors_are_reported_to_model() {
         Duration::from_secs(1),
     );
     assert!(d.execute(&call).await.output.contains("failed"));
+}
+
+const FAST_KEEPALIVE: Keepalive = Keepalive {
+    ping_interval: Duration::from_millis(100),
+    dead_after: Duration::from_millis(400),
+};
+
+#[tokio::test]
+async fn silent_vendor_connection_times_out() {
+    // Server accepts but never reads or writes: no Pong, no frames.
+    let (ws_url, mut conns) = mock_ws().await;
+    let cfg = format!("[[agent]]\nname='p'\nmatch='*'\nprovider='pcm_ws'\nurl='{ws_url}/x'\n");
+    let hold = tokio::spawn(async move {
+        let c = conns.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        drop(c);
+    });
+    let h = start_bridge_with(&cfg, "ka1", FAST_KEEPALIVE).await;
+    let t0 = Instant::now();
+    let res = tokio::time::timeout(Duration::from_secs(3), h.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(res.end, BridgeEnd::WsTimeout);
+    assert_eq!(res.end.reason(), "ws_timeout");
+    assert!(t0.elapsed() < Duration::from_secs(2));
+    hold.abort();
+}
+
+#[tokio::test]
+async fn pongs_keep_quiet_vendor_connection_alive() {
+    // Server only reads (tungstenite answers our Pings with Pongs) and never
+    // sends data frames: the bridge must stay up well past dead_after.
+    let (ws_url, mut conns) = mock_ws().await;
+    let cfg = format!("[[agent]]\nname='p'\nmatch='*'\nprovider='pcm_ws'\nurl='{ws_url}/x'\n");
+    let (ping_tx, ping_rx) = oneshot::channel::<()>();
+    let reader = tokio::spawn(async move {
+        use futures::StreamExt;
+        let mut c = conns.recv().await.unwrap();
+        let mut ping_tx = Some(ping_tx);
+        while let Some(Ok(m)) = c.ws.next().await {
+            if m.is_ping()
+                && let Some(tx) = ping_tx.take()
+            {
+                let _ = tx.send(());
+            }
+        }
+    });
+    let h = start_bridge_with(&cfg, "ka2", FAST_KEEPALIVE).await;
+    tokio::time::timeout(Duration::from_secs(2), ping_rx)
+        .await
+        .expect("no ping sent")
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(!h.task.is_finished(), "bridge ended despite pongs");
+    h.cancel.cancel();
+    let res = tokio::time::timeout(Duration::from_secs(3), h.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(res.end, BridgeEnd::Cancelled);
+    reader.abort();
 }

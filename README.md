@@ -113,6 +113,7 @@ sip2agent **没有 SIP 鉴权**。每一通电话都会消耗厂商额度,暴露
 
 - **配置 `sip.allow`**:只放行你的 PBX / SBC。判断依据是 SIP 包的真实来源地址,不在名单内一律回 403,也不会连接厂商。不配置时启动日志会打 WARN。
 - **防火墙**:SIP 端口和 RTP 端口段只对 PBX 开放。
+- **RTP 来源锁定**:每通电话只接收一个来源的 RTP(优先 SDP 里的地址,否则第一个有效来源),其他来源的包直接丢弃,防止往通话里注入音频。只有原来源静默 1 秒以上、新来源连续稳定发包时才会切换;re-INVITE 换了媒体地址会重新锁定。
 - **key 的存放**:用 `api_key_env` 从环境变量读取,不要写进配置文件提交到仓库。key 只会出现在 WebSocket 握手头里,不会进日志。
 
 ## 通话流程
@@ -213,6 +214,7 @@ Content-Type: application/json
 - `caller_bye`:主叫挂机;
 - `agent_hangup`:pcm_ws 要求挂机;
 - `ws_closed`、`ws_error`:厂商 WebSocket 断开或出错;
+- `ws_timeout`:厂商连接假死(15 秒内没收到任何帧,包括对 Ping 的 Pong);
 - `vendor_error`:厂商报致命错误;
 - `session_ready_timeout`:厂商会话迟迟没有就绪;
 - `rtp_timeout`:收不到 RTP;

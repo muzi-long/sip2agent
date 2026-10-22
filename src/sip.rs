@@ -33,12 +33,15 @@ use tracing::{debug, error, info, warn};
 /// How long shutdown waits for active calls to send BYE.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
+#[derive(Clone)]
 struct CallHandle {
     cancel: CancellationToken,
     /// Hangup reason decided by the SIP side (caller BYE, CANCEL, shutdown...).
     remote_reason: Arc<Mutex<Option<&'static str>>>,
     /// Our current SDP answer (for re-INVITE / UPDATE refreshes).
     answer_sdp: Arc<Mutex<Option<String>>>,
+    /// Running RTP session (set once media starts), for re-INVITE address changes.
+    rtp: Arc<Mutex<Option<rtp::RtpControl>>>,
 }
 
 type Calls = Arc<Mutex<HashMap<String, CallHandle>>>;
@@ -300,10 +303,9 @@ async fn on_invite(ctx: &Arc<InviteCtx>, mut tx: Transaction) {
         cancel: CancellationToken::new(),
         remote_reason: Arc::new(Mutex::new(None)),
         answer_sdp: Arc::new(Mutex::new(None)),
+        rtp: Arc::new(Mutex::new(None)),
     };
-    let cancel = handle.cancel.clone();
-    let remote_reason = handle.remote_reason.clone();
-    let answer_slot = handle.answer_sdp.clone();
+    let slots = handle.clone();
     ctx.calls
         .lock()
         .expect("calls lock")
@@ -328,16 +330,7 @@ async fn on_invite(ctx: &Arc<InviteCtx>, mut tx: Transaction) {
             to: called,
             agent: Arc::new(agent),
         };
-        run_call(
-            &ctx,
-            dialog.clone(),
-            info,
-            offer,
-            cancel,
-            remote_reason,
-            answer_slot,
-        )
-        .await;
+        run_call(&ctx, dialog.clone(), info, offer, slots).await;
         ctx.calls.lock().expect("calls lock").remove(&dialog_key);
         ctx.dialog_layer.remove_dialog(&dialog.id());
     });
@@ -389,10 +382,14 @@ async fn run_call(
     dialog: InviteDialog,
     info: CallInfo,
     offer: sdp::Offer,
-    cancel: CancellationToken,
-    remote_reason: Arc<Mutex<Option<&'static str>>>,
-    answer_slot: Arc<Mutex<Option<String>>>,
+    slots: CallHandle,
 ) {
+    let CallHandle {
+        cancel,
+        remote_reason,
+        answer_sdp: answer_slot,
+        rtp: rtp_slot,
+    } = slots;
     let call_id = info.call_id.clone();
     let socket = match ctx.ports.bind().await {
         Ok(s) => s,
@@ -446,6 +443,7 @@ async fn run_call(
                 return;
             }
         };
+    *rtp_slot.lock().expect("rtp lock") = Some(rtp_session.control());
 
     let rtp_timeout =
         (ctx.cfg.rtp.timeout_secs > 0).then(|| Duration::from_secs(ctx.cfg.rtp.timeout_secs));
@@ -522,6 +520,14 @@ async fn state_loop(mut rx: DialogStateReceiver, layer: Arc<DialogLayer>, calls:
             }
             DialogState::Updated(id, req, handle) => {
                 // re-INVITE / UPDATE (session refresh, hold): answer with our SDP.
+                // A new remote media address resets the RTP latch.
+                if let Ok(body) = std::str::from_utf8(&req.body)
+                    && let Ok(offer) = sdp::parse_offer(body)
+                    && let Some(addr) = offer.remote_rtp
+                    && let Some(ctl) = rtp_control_for(&calls, &id)
+                {
+                    ctl.update_sdp_remote(addr);
+                }
                 let sdp = answer_for(&calls, &id);
                 tokio::spawn(async move {
                     let with_sdp = !req.body.is_empty() || req.method == Method::Invite;
@@ -554,6 +560,14 @@ async fn state_loop(mut rx: DialogStateReceiver, layer: Arc<DialogLayer>, calls:
             other => debug!(state = %other, "dialog state"),
         }
     }
+}
+
+fn rtp_control_for(calls: &Calls, id: &DialogId) -> Option<rtp::RtpControl> {
+    calls
+        .lock()
+        .expect("calls lock")
+        .get(&id.to_string())
+        .and_then(|h| h.rtp.lock().expect("rtp lock").clone())
 }
 
 fn answer_for(calls: &Calls, id: &DialogId) -> Option<String> {
