@@ -1,0 +1,35 @@
+main:
+  push:
+    - name: build-sip2agent
+      runner:
+        tags: cnb:arch:amd64
+      services:
+        - docker
+      docker:
+        volumes:
+          - /usr/local/cargo/registry
+          - /root/.cache/sip2agent-target
+      env:
+        # ${CNB_REPO_SLUG_LOWERCASE} = voicelen/sip2agent,拼出来 docker.cnb.cool/voicelen/sip2agent
+        IMAGE: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}
+      stages:
+        - name: ci
+          image: rust:1.92-bookworm
+          env:
+            # target 目录挂 volume,跨构建复用增量产物
+            CARGO_TARGET_DIR: /root/.cache/sip2agent-target
+          script:
+            # crates 走 rsproxy.cn 国内镜像,防 crates.io 链路抖动(与 Dockerfile 一致)
+            - printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' > /usr/local/cargo/config.toml
+            # 官方镜像是 minimal profile,不一定带 rustfmt/clippy
+            - rustup component add rustfmt clippy
+            - cargo fmt --check
+            - cargo clippy --locked --all-targets -- -D warnings
+            - cargo test --locked
+
+        - name: build-and-push
+          script:
+            - TAG=$(date +%Y%m%d)-$(echo "$CNB_COMMIT" | cut -c1-7)
+            - echo "build and push $IMAGE:$TAG"
+            - docker buildx build --platform linux/amd64 --progress=plain --cache-from type=registry,ref=$IMAGE:buildcache --cache-to type=registry,ref=$IMAGE:buildcache,mode=max,image-manifest=true -t "$IMAGE:$TAG" -t "$IMAGE:latest" --push .
+            - echo "pushed $IMAGE:$TAG"

@@ -1,0 +1,7 @@
+/target
+config.toml
+*.log
+.env
+.DS_Store
+.idea/
+.vscode/
