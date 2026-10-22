@@ -146,41 +146,81 @@ parameters = {{ type = "object", properties = {{ order_id = {{ type = "string" }
 
         let upd = c.next_json().await;
         assert_eq!(upd["type"], "session.update");
-        assert_eq!(
-            upd["session"]["audio"]["input"]["format"]["sample_rate"],
-            16000
+        let s = &upd["session"];
+        assert_eq!(s["audio"]["input"]["format"]["sample_rate"], 8000);
+        assert_eq!(s["audio"]["output"]["format"]["sample_rate"], 8000);
+        assert!(
+            s["turn_detection"].is_null(),
+            "greeting runs in manual mode"
         );
-        assert_eq!(
-            upd["session"]["tools"][0]["function"]["name"],
-            "query_order"
+        assert!(
+            s["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("「您好，这里是测试客服」")
         );
+        assert_eq!(s["tools"][0]["function"]["name"], "query_order");
         c.send_json(json!({"type": "session.created", "session": {"id": "sess_1"}}))
             .await;
         // Nothing (no audio) may arrive before session.updated.
         tokio::time::sleep(Duration::from_millis(200)).await;
         c.send_json(json!({"type": "session.updated", "session": {"id": "sess_1"}}))
             .await;
-        // Greeting comes first, before any audio.
-        assert_eq!(c.next_json().await, json!({"type": "response.create"}));
-        // Uplink audio: 20 ms at 16 kHz.
+        // Greeting: 300 ms of committed silence, no caller audio in between.
         let a = c.next_json().await;
         assert_eq!(a["type"], "input_audio_buffer.append");
-        assert_eq!(unb64(a["audio"].as_str().unwrap()).len(), 320);
+        let sil = unb64(a["audio"].as_str().unwrap());
+        assert_eq!(sil.len(), 2400);
+        assert!(sil.iter().all(|x| *x == 0));
+        assert_eq!(
+            c.next_json().await,
+            json!({"type": "input_audio_buffer.commit"})
+        );
+        c.send_json(json!({"type": "input_audio_buffer.committed", "item_id": "g0"}))
+            .await;
+        assert_eq!(c.next_json().await, json!({"type": "response.create"}));
 
-        // Greeting audio: 1 s of 24 kHz tone in 50 deltas.
+        // Greeting audio: 1 s of 8 kHz tone in 50 deltas.
         c.send_json(json!({"type": "response.created", "response": {"id": "r1"}}))
             .await;
-        let t = tone(480, 24000.0, 300.0, 10000.0);
+        c.send_json(json!({"type": "conversation.item.input_audio_transcription.completed", "item_id": "g0", "content_index": 0, "transcript": ""}))
+            .await;
+        let t = tone(160, 8000.0, 300.0, 10000.0);
         for _ in 0..50 {
             c.send_json(json!({"type": "response.audio.delta", "response_id": "r1", "item_id": "i1", "output_index": 0, "content_index": 0, "delta": b64(&t)}))
                 .await;
         }
         c.send_json(json!({"type": "response.audio_transcript.done", "response_id": "r1", "transcript": "您好，这里是测试客服"}))
             .await;
+        // Still held: the caller's audio must not reach us mid-greeting.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         c.send_json(
             json!({"type": "response.done", "response": {"id": "r1", "status": "completed"}}),
         )
         .await;
+        let restore = c.next_json().await;
+        assert_eq!(restore["type"], "session.update");
+        assert_eq!(restore["session"]["turn_detection"]["type"], "server_vad");
+        assert_eq!(restore["session"]["instructions"], "你是客服");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        c.send_json(json!({"type": "session.updated", "session": {"id": "sess_1"}}))
+            .await;
+        // Held caller audio is replayed in 100 ms chunks, then live 20 ms frames.
+        let first = c.next_json().await;
+        assert_eq!(first["type"], "input_audio_buffer.append");
+        let held = unb64(first["audio"].as_str().unwrap());
+        assert_eq!(held.len(), 800, "replay chunk");
+        assert!(
+            held.iter().any(|x| x.unsigned_abs() > 1000),
+            "real caller audio"
+        );
+        let mut lens = Vec::new();
+        for _ in 0..30 {
+            let a = c.next_json().await;
+            assert_eq!(a["type"], "input_audio_buffer.append");
+            lens.push(unb64(a["audio"].as_str().unwrap()).len());
+        }
+        assert!(lens.contains(&160), "live frames follow: {lens:?}");
 
         // Caller asks; model calls a tool.
         c.send_json(json!({"type": "conversation.item.input_audio_transcription.completed", "item_id": "u1", "content_index": 0, "transcript": "查一下订单A1"}))

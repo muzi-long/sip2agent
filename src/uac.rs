@@ -1,6 +1,7 @@
 //! Minimal test UAC (rsipstack) used by `examples/uac.rs` and the
-//! integration tests: INVITE with a G.711 offer, stream a test tone over RTP,
-//! count what comes back, then BYE (or observe the remote BYE).
+//! integration tests: INVITE with a G.711 offer, stream a test tone (or
+//! scripted 8 kHz clips) over RTP, count/record what comes back, then BYE
+//! (or observe the remote BYE).
 
 use crate::audio::g711::G711;
 use crate::audio::{FRAME_MS, SIP_FRAME_SAMPLES};
@@ -38,6 +39,11 @@ pub struct UacOptions {
     pub send_rtp: bool,
     /// Override the generated SDP offer (e.g. codec negotiation tests).
     pub raw_offer: Option<String>,
+    /// 8 kHz PCM clips to play at offsets from answer. When non-empty this
+    /// replaces the tone; silence is sent between clips.
+    pub script: Vec<(Duration, Vec<i16>)>,
+    /// Keep the decoded downlink audio in [`UacReport::received`].
+    pub record: bool,
 }
 
 impl Default for UacOptions {
@@ -52,6 +58,8 @@ impl Default for UacOptions {
             local_ip: "127.0.0.1".parse().expect("static"),
             send_rtp: true,
             raw_offer: None,
+            script: Vec::new(),
+            record: false,
         }
     }
 }
@@ -69,6 +77,8 @@ pub struct UacReport {
     pub remote_hangup: bool,
     /// Whether our BYE got sent (we hung up).
     pub local_hangup: bool,
+    /// Decoded downlink audio, 8 kHz (only with `record`).
+    pub received: Vec<i16>,
 }
 
 pub async fn run(opts: UacOptions) -> Result<UacReport> {
@@ -158,7 +168,9 @@ pub async fn run(opts: UacOptions) -> Result<UacReport> {
     let codec = answer.codec;
 
     let mut ticker = tokio::time::interval(Duration::from_millis(FRAME_MS));
-    let deadline = tokio::time::Instant::now() + opts.duration;
+    let answered = tokio::time::Instant::now();
+    let deadline = answered + opts.duration;
+    let mut sent_samples: usize = 0;
     let mut seq: u16 = 1;
     let mut ts: u32 = 0;
     let mut phase: f32 = 0.0;
@@ -174,13 +186,18 @@ pub async fn run(opts: UacOptions) -> Result<UacReport> {
                 }
             }
             _ = ticker.tick(), if opts.send_rtp => {
-                let frame: Vec<i16> = (0..SIP_FRAME_SAMPLES)
-                    .map(|_| {
-                        let s = if opts.tone_hz > 0.0 { (phase.sin() * 8000.0) as i16 } else { 0 };
-                        phase += step;
-                        s
-                    })
-                    .collect();
+                let frame: Vec<i16> = if opts.script.is_empty() {
+                    (0..SIP_FRAME_SAMPLES)
+                        .map(|_| {
+                            let s = if opts.tone_hz > 0.0 { (phase.sin() * 8000.0) as i16 } else { 0 };
+                            phase += step;
+                            s
+                        })
+                        .collect()
+                } else {
+                    script_frame(&opts.script, sent_samples)
+                };
+                sent_samples += SIP_FRAME_SAMPLES;
                 let pkt = RtpPacket {
                     marker: seq == 1,
                     payload_type: codec.payload_type(),
@@ -203,6 +220,9 @@ pub async fn run(opts: UacOptions) -> Result<UacReport> {
                     if pcm.iter().any(|s| s.unsigned_abs() > 500) {
                         report.rtp_received_nonsilent += 1;
                     }
+                    if opts.record {
+                        report.received.extend_from_slice(&pcm);
+                    }
                 }
             }
         }
@@ -214,4 +234,90 @@ pub async fn run(opts: UacOptions) -> Result<UacReport> {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     Ok(report)
+}
+
+/// The 20 ms frame starting at sample `at` (8 kHz) of a clip script.
+fn script_frame(script: &[(Duration, Vec<i16>)], at: usize) -> Vec<i16> {
+    let mut frame = vec![0i16; SIP_FRAME_SAMPLES];
+    for (offset, clip) in script {
+        let start = (offset.as_secs_f64() * 8000.0) as usize;
+        for (i, s) in frame.iter_mut().enumerate() {
+            if let Some(v) = (at + i).checked_sub(start).and_then(|k| clip.get(k)) {
+                *s = *v;
+            }
+        }
+    }
+    frame
+}
+
+/// Read a mono PCM16 WAV file (any chunk layout), returning samples + rate.
+pub fn read_wav(path: &std::path::Path) -> Result<(Vec<i16>, u32)> {
+    let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return Err(anyhow!("{}: not a WAV file", path.display()));
+    }
+    let (mut rate, mut pos) = (0u32, 12usize);
+    while pos + 8 <= data.len() {
+        let id = &data[pos..pos + 4];
+        let len = u32::from_le_bytes(data[pos + 4..pos + 8].try_into()?) as usize;
+        let body = &data[pos + 8..(pos + 8 + len).min(data.len())];
+        match id {
+            b"fmt " if body.len() >= 16 => {
+                let channels = u16::from_le_bytes([body[2], body[3]]);
+                let bits = u16::from_le_bytes([body[14], body[15]]);
+                if channels != 1 || bits != 16 {
+                    return Err(anyhow!("{}: need mono PCM16", path.display()));
+                }
+                rate = u32::from_le_bytes(body[4..8].try_into()?);
+            }
+            b"data" => return Ok((crate::audio::bytes_to_pcm(body), rate)),
+            _ => {}
+        }
+        pos += 8 + len + (len & 1);
+    }
+    Err(anyhow!("{}: no data chunk", path.display()))
+}
+
+/// Write mono PCM16 as a WAV file.
+pub fn write_wav(path: &std::path::Path, pcm: &[i16], rate: u32) -> Result<()> {
+    let bytes = crate::audio::pcm_to_bytes(pcm);
+    let mut out = Vec::with_capacity(44 + bytes.len());
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * 2).to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&bytes);
+    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn script_frames_and_wav_roundtrip() {
+        let script = vec![(Duration::from_millis(10), vec![7i16; 100])];
+        let f0 = script_frame(&script, 0);
+        assert_eq!(f0[79], 0);
+        assert_eq!(f0[80], 7);
+        assert_eq!(f0[159], 7);
+        let f1 = script_frame(&script, 160);
+        assert_eq!(f1[19], 7);
+        assert_eq!(f1[20], 0);
+
+        let dir = std::env::temp_dir().join(format!("sip2agent-wav-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.wav");
+        write_wav(&p, &[1, -2, 3], 8000).unwrap();
+        assert_eq!(read_wav(&p).unwrap(), (vec![1, -2, 3], 8000));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

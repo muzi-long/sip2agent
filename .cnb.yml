@@ -10,7 +10,7 @@ main:
           - /usr/local/cargo/registry
           - /root/.cache/sip2agent-target
       env:
-        # ${CNB_REPO_SLUG_LOWERCASE} = voicelen/sip2agent,拼出来 docker.cnb.cool/voicelen/sip2agent
+        # 镜像地址 = 仓库所在 cnb 镜像仓库 + 仓库路径(小写)
         IMAGE: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}
       stages:
         - name: ci

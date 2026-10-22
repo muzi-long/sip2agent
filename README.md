@@ -9,11 +9,24 @@
 | provider | 厂商 / 协议 | 上行 | 下行 |
 |---|---|---|---|
 | `doubao` | 豆包实时语音 3.0(Seeduplex,全双工) | PCM16 16 kHz | PCM16 24 kHz(`pcm_s16le`) |
-| `qwen_omni` | 阿里云百炼 Qwen-Omni Realtime(默认 `qwen3.8-omni-flash-realtime`) | PCM16 16 kHz | PCM16 24 kHz |
+| `qwen_omni` | 阿里云百炼 Qwen-Omni Realtime(默认 `qwen3.8-omni-flash-realtime`) | PCM16 8 kHz | PCM16 8 kHz(与 SIP 同频,不重采样) |
 | `pcm_ws` | 通用裸 PCM WebSocket(自建模型服务) | PCM16,默认 8 kHz | 同上 |
 | `echo` | 内置回声,仅供冒烟测试 | — | — |
 
 刻意不做的:**DTMF**(不协商 telephone-event,收到也丢弃);PCMA/PCMU 以外的编码;RTCP;SRTP;呼出。
+
+## 安装
+
+三选一:
+
+- **Docker 镜像**(GitHub Container Registry,main 分支每次推送更新 `latest`):
+  ```bash
+  docker run -d --name sip2agent --network host \
+    -v $PWD/config.toml:/app/config.toml ghcr.io/muzi-long/sip2agent:latest
+  ```
+  国内网络可用 cnb.cool 上同名仓库 CI 同步构建的镜像(同样有 `latest` tag)。
+- **预编译二进制**:到 [GitHub Releases](https://github.com/muzi-long/sip2agent/releases) 下载 linux x86_64 / linux aarch64 / macOS arm64 的 tar.gz,解压后 `./sip2agent -c config.toml`。
+- **源码编译**:`cargo build --release`(Rust 1.92+)。
 
 ## 快速开始
 
@@ -37,12 +50,7 @@ cargo run --example uac -- --server 127.0.0.1:5060 --to 9000 --secs 3
 cargo run --example pcm_ws_echo -- --listen 127.0.0.1:9100 --hangup-after-secs 5
 ```
 
-Docker:
-
-```bash
-docker build -t sip2agent .
-docker run --network host -v $PWD/config.toml:/app/config.toml sip2agent
-```
+自己构建镜像:`docker build -t sip2agent .`。
 
 生产建议 `network_mode: host`(RTP 端口段很宽,端口映射开销大),NAT 后面必须配 `sip.external_ip`。
 
@@ -94,7 +102,7 @@ docker run --network host -v $PWD/config.toml:/app/config.toml sip2agent
 | `model` | doubao / qwen | 豆包默认 `1.2.6.1`;Qwen 默认 `qwen3.8-omni-flash-realtime` |
 | `voice` | doubao(必填)/ qwen | Qwen 默认 `Tina` |
 | `instructions` | doubao / qwen | 系统提示词 |
-| `greeting` | doubao / qwen | 开场白,接通后先说 |
+| `greeting` | doubao / qwen | 开场白,接通后先一字不差地说 |
 | `turn_detection` | qwen | `server_vad`(默认)或 `semantic_vad` |
 | `extension` | doubao | 原样透传到 `session.create` 顶层的 `extension`(asr/tts/dialog) |
 | `sample_rate` | pcm_ws | 默认 8000(与 SIP 同频,不重采样) |
@@ -151,11 +159,14 @@ Content-Type: application/json
 
 ### Qwen-Omni Realtime(`qwen_omni`)
 
+以下均为 `qwen3.8-omni-flash-realtime` 实测 2026-10-22:
+
 - qwen3.8 必须用 workspace 专属域名;头 `Authorization: Bearer <DashScope key>`。
 - 先 `session.update`,**收到 `session.updated` 才开始发音频**。
-- `response.create` 没有参数,所以开场白写进 session instructions,再发一个空的 `response.create` 触发。
+- **8 kHz 进出**:文档只写了 16k 入 / 24k 出,但 `sample_rate: 8000` 被接受并在 `session.updated` 回显,双向可用,所以和 SIP 同频、不重采样。
+- **开场白**:新会话直接发 `response.create` 会被拒(`Cannot create response without input, history, or instructions`,即使配了 instructions)。做法:`turn_detection: null` + "下一句必须一字不差地说……"指令 → 追加 300 ms 静音并 `input_audio_buffer.commit` → 收到 `committed` 后 `response.create` → 该回复 `response.done` 后 `session.update` 切回 VAD、还原 instructions → `session.updated` 后再放行主叫音频。手动模式期间发主叫音频服务端会断开,所以这段时间主叫音频在本地暂存,切回 VAD 后补发;主叫在开场白期间开口,补发后照样触发打断。
 - 打断信号 `input_audio_buffer.speech_started`;工具结果 `conversation.item.create{item:{type:"function_call_output"}}` 后必须 `response.create`;多个函数调用会攒到 `response.done` 一起执行。
-- `error` 事件只记日志不挂机(取消一个已结束的 response 也会报 error);致命问题服务端会断开 WS。会话最长 120 分钟。
+- 会话配置被拒(就绪前的 `error`)按致命处理;之后的 `error` 只记日志不挂机(取消一个已结束的 response 也会报 error),致命问题服务端会断开 WS。会话最长 120 分钟。
 
 ### 通用 PCM WS(`pcm_ws`)
 
@@ -172,8 +183,8 @@ Content-Type: application/json
                                │ 160 样本/20ms 帧      │
                                ▼                       │
                            call.rs ──► realtime/bridge.rs (每 20ms 一拍)
-                                          ├─ 上行:1 帧 → 8k→16k 重采样 → 协议编码 → WS(无音频则发静音)
-                                          ├─ 下行:WS → 协议解码 → 24k→8k → 播放缓冲 → 1 帧 → RTP
+                                          ├─ 上行:1 帧 → 重采样到厂商输入频率(豆包 16k;Qwen/PCM 8k 不变)→ 协议编码 → WS(无音频则发静音;适配器要求时本地暂存)
+                                          ├─ 下行:WS → 协议解码 → 重采样到 8k(豆包 24k→8k)→ 播放缓冲 → 1 帧 → RTP
                                           ├─ 打断:清空播放缓冲 + 取消在途回复
                                           └─ 工具:webhook.rs 并发执行 → 一次性回传
 ```
@@ -197,7 +208,14 @@ Content-Type: application/json
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
-测试包括:各模块单测(G.711、重采样、SDP、RTP、配置、三个厂商的编解码按官方文档事件样例)、端到端 SIP 测试(进程内服务 + 测试 UAC + mock WS/HTTP)、豆包/Qwen 桥接全流程测试(mock 厂商服务)。厂商真实接口需要 key,仓库测试只用 mock。
+测试包括:各模块单测(G.711、重采样、SDP、RTP、配置、三个厂商的编解码按官方文档 / 实测事件样例)、端到端 SIP 测试(进程内服务 + 测试 UAC + mock WS/HTTP)、豆包/Qwen 桥接全流程测试(mock 厂商服务)。常规 `cargo test` 不连真实厂商。
+
+Qwen 真实联调(完整 SIP 链路:测试 UAC → sip2agent → Qwen,下行录成 wav),默认跳过,用法见 `tests/qwen_live.rs` 头注释:
+
+```bash
+SIP2AGENT_QWEN_LIVE=1 SIP2AGENT_LIVE_DIR=/path/to/wavs QWEN_URL=wss://... DASHSCOPE_API_KEY=sk-... \
+  cargo test --test qwen_live -- --nocapture --test-threads=1
+```
 
 ## 致谢
 

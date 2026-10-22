@@ -91,7 +91,7 @@ pub trait RealtimeProtocol: Send + Sync {
     /// Handshake messages sent immediately after connect.
     fn session_open(&self) -> Vec<UplinkMessage>;
     /// Opening-line messages, sent once when the session becomes ready.
-    fn greeting(&self) -> Vec<UplinkMessage>;
+    fn greeting(&mut self) -> Vec<UplinkMessage>;
     /// Encode one 20 ms uplink frame (PCM16 at `input_rate`).
     fn encode_audio(&self, pcm: &[i16]) -> Vec<UplinkMessage>;
     /// Messages to cancel the in-flight response on barge-in.
@@ -101,8 +101,19 @@ pub trait RealtimeProtocol: Send + Sync {
     /// Graceful-close messages. Non-empty means: wait for
     /// [`DownlinkEvent::SessionClosed`] (bounded) before closing the socket.
     fn close(&self) -> Vec<UplinkMessage>;
-    fn decode_text(&self, text: &str) -> Vec<DownlinkEvent>;
+    /// Decode one text frame. Stateful adapters may also queue protocol
+    /// reactions, drained right after via [`RealtimeProtocol::take_uplink`].
+    fn decode_text(&mut self, text: &str) -> Vec<DownlinkEvent>;
     fn decode_binary(&self, bytes: &[u8]) -> Vec<DownlinkEvent>;
+    /// Messages the adapter wants sent in reaction to the last decoded frame.
+    fn take_uplink(&mut self) -> Vec<UplinkMessage> {
+        Vec::new()
+    }
+    /// While true the bridge must not send caller audio; it buffers it and
+    /// replays the backlog once this turns false.
+    fn hold_uplink(&self) -> bool {
+        false
+    }
 }
 
 /// Build the adapter for an agent. Fails when a required API key is missing.

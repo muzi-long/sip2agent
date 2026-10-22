@@ -9,11 +9,16 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test   #
 cargo run -- -c config.toml [--check]
 cargo run --example uac -- --server 127.0.0.1:5060 --to 9000 --secs 3        # 测试 UAC
 cargo run --example pcm_ws_echo -- --listen 127.0.0.1:9100                    # 参考 pcm_ws 服务
+# Qwen 真实联调(默认跳过;wav 用 macOS say 生成,见 tests/qwen_live.rs 头注释)
+SIP2AGENT_QWEN_LIVE=1 SIP2AGENT_LIVE_DIR=<wav目录> QWEN_URL=wss://... DASHSCOPE_API_KEY=... cargo test --test qwen_live -- --nocapture --test-threads=1
 ```
 
 - 工具链 Rust 1.92,edition 2024,tokio。lib + bin 同一个 crate(lib 供 tests/examples 复用)。
 - TLS 统一走 rustls + ring(`install_crypto_provider()`),**不要引入 aws-lc / openssl / native-tls**(Docker 构建与交叉编译都会变复杂)。
-- CI:`.cnb.yml` 在 main push 时跑 fmt/clippy/test,再 buildx 推 `docker.cnb.cool/voicelen/sip2agent:{日期-sha}` 和 `latest`。
+- GitHub Actions(`CARGO_MIRROR=` 直连 crates.io):
+  - `ci.yml`:push main / PR 跑 fmt/clippy/test + docker build;push main 时推 `ghcr.io/<owner>/sip2agent:latest` / `sha-<短sha>`
+  - `release.yml`:打 tag `v*` → linux x86_64 / linux aarch64 / macOS arm64 二进制 tar.gz 上传 GitHub Release,并推多架构镜像 `ghcr.io/<owner>/sip2agent:<版本>`
+- CI:`.cnb.yml` 在 main push 时跑 fmt/clippy/test,再 buildx 推 `${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:{日期-sha}` 和 `latest`。
 
 ## 模块地图
 
@@ -26,19 +31,20 @@ cargo run --example pcm_ws_echo -- --listen 127.0.0.1:9100                    # 
 | `src/rtp.rs` | RTP 包、端口分配、对称 RTP、收包重组 160 样本帧、`MediaPort` |
 | `src/audio/g711.rs` / `resample.rs` | G.711;rustpbx 原样移植的线性重采样(勿改算法,保留署名头) |
 | `src/call.rs` | 单通媒体编排、RTP 超时看门狗、echo agent |
-| `src/realtime/mod.rs` | `RealtimeProtocol` trait、`DownlinkEvent` |
-| `src/realtime/bridge.rs` | 20 ms 节拍主循环:上行每拍必发一帧(无 RTP 发静音)、播放缓冲、打断、工具、转写、优雅关闭 |
-| `src/realtime/{doubao,qwen_omni,pcm_ws}.rs` | 纯编解码适配器(无 IO,单测覆盖官方事件样例) |
+| `src/realtime/mod.rs` | `RealtimeProtocol` trait(含 `take_uplink` 协议回应、`hold_uplink` 暂停上行)、`DownlinkEvent` |
+| `src/realtime/bridge.rs` | 20 ms 节拍主循环:上行每拍必发一帧(无 RTP 发静音;`hold_uplink` 时本地暂存、解除后 100 ms 一块补发)、播放缓冲、打断、工具、转写、优雅关闭 |
+| `src/realtime/{doubao,qwen_omni,pcm_ws}.rs` | 适配器:编解码 + 协议状态机(无 IO / 计时),单测覆盖官方 / 实测事件样例 |
 | `src/webhook.rs` | 工具 webhook、通话结束 webhook |
-| `src/uac.rs` | 测试 UAC(examples / tests 共用) |
-| `tests/` | `sip_calls.rs` 端到端 SIP;`vendor_bridges.rs` 豆包/Qwen mock 全流程;`common/` mock WS/HTTP |
+| `src/uac.rs` | 测试 UAC(examples / tests 共用):音调或按时间点播 wav 片段、录下行、wav 读写 |
+| `tests/` | `sip_calls.rs` 端到端 SIP;`vendor_bridges.rs` 豆包/Qwen mock 全流程;`qwen_live.rs` Qwen 真实联调(env 门控);`common/` mock WS/HTTP |
 
 ## 硬规则
 
 - **不做 DTMF**:SDP 不协商 telephone-event,RTP 收到也丢弃,协议适配器不编码 DTMF。
 - **只支持 PCMA / PCMU,8 kHz,ptime 20**;offer 里没有就 488。不要加其他编码。
-- **上行节奏**:bridge 每 20 ms 发且只发一帧,静音也发(豆包靠上行保活,节奏偏离会报错)。不要改成"有音频才发"。
-- **协议适配器保持纯函数式**:IO、计时、状态机都放 `bridge.rs`;新厂商 = 新适配器 + 文档样例单测 + mock 全流程测试。
+- **上行节奏**:bridge 每 20 ms 发且只发一帧,静音也发(豆包靠上行保活,节奏偏离会报错)。不要改成"有音频才发"。唯一例外是适配器 `hold_uplink()`(Qwen 开场白期间)。
+- **适配器不做 IO、不计时**:WS 收发、计时、缓冲都在 `bridge.rs`;协议自身的状态机可以放适配器(如 Qwen 开场白),对服务端事件的回应走 `take_uplink()`。新厂商 = 新适配器 + 文档样例单测 + mock 全流程测试,能拿到 key 就加 env 门控的 live 测试。
+- **Qwen(qwen3.8-omni-flash-realtime)实测 2026-10-22 的结论,改之前先重测**:8 kHz 进出可用(不重采样);新会话裸 `response.create` 会被拒,开场白必须走"手动模式 + 原话指令 + commit 静音 → response.create → done 后切回 VAD"且期间暂存主叫音频(手动模式下发主叫音频服务端会断开);指令里必须给出原话并说明收到的是静音,否则模型会即兴发挥。
 - **厂商协议必须以最新官方文档为准**:改适配器前重新核对官方文档(豆包 6561/2549778、6561/2549732 及官方 demo;阿里云 model-studio client-events / server-events),不要凭记忆或第三方博客;核对日期写进适配器头注释。
 - API key 只能出现在 WS 握手头里,不进日志、不进 URL、`Debug` 输出要脱敏。
 - 新增 `[[agent]]` 字段要同步 `config.example.toml`(有单测保证它可解析)和 README 配置表。

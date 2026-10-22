@@ -2,7 +2,9 @@
 //!
 //! Every 20 ms tick it:
 //! 1. sends exactly one uplink frame to the vendor (caller audio, or digital
-//!    silence when no RTP arrived — Doubao needs real-time pacing/keepalive),
+//!    silence when no RTP arrived — Doubao needs real-time pacing/keepalive);
+//!    while the adapter's `hold_uplink()` is true the frame is buffered
+//!    instead and the backlog is replayed when the hold ends,
 //! 2. plays exactly one 160-sample frame from the playout buffer to the
 //!    caller (silence when empty), giving a steady 20 ms RTP clock.
 //!
@@ -39,6 +41,10 @@ pub const HANGUP_DRAIN_MAX: Duration = Duration::from_secs(10);
 const PLAYOUT_MAX_SAMPLES: usize = SIP_RATE as usize * 600;
 /// Uplink jitter cap: older frames beyond this backlog are dropped.
 const UPLINK_MAX_BACKLOG: usize = 5;
+/// Caller audio held while the adapter asks to (e.g. Qwen's greeting): 30 s.
+const HELD_MAX_MS: usize = 30_000;
+/// Held audio is replayed in chunks of this length.
+const REPLAY_CHUNK_MS: usize = 100;
 
 /// Why the bridge ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +198,7 @@ impl Transcripts {
 
 /// Run the bridge until cancelled or the vendor ends the session.
 pub async fn run_bridge(
-    protocol: Box<dyn RealtimeProtocol>,
+    mut protocol: Box<dyn RealtimeProtocol>,
     ws: WsStream,
     mut media: MediaPort,
     tools: ToolDispatcher,
@@ -208,6 +214,8 @@ pub async fn run_bridge(
     };
     let mut playout: VecDeque<i16> = VecDeque::new();
     let mut up_buf: Vec<i16> = Vec::with_capacity(frame_samples(in_rate));
+    let mut held: VecDeque<i16> = VecDeque::new();
+    let held_max = in_rate as usize * HELD_MAX_MS / 1000;
     let silence = vec![0i16; SIP_FRAME_SAMPLES];
     let (tool_tx, mut tool_rx) = mpsc::channel::<Vec<ToolOutput>>(8);
     let mut pending_calls: Vec<ToolCall> = Vec::new();
@@ -250,8 +258,26 @@ pub async fn run_bridge(
                 if ready {
                     let pcm = frame.as_deref().unwrap_or(&silence);
                     resample_linear_into(pcm, SIP_RATE, in_rate, &mut up_buf);
-                    if let Err(e) = send_all(&mut ws_tx, protocol.encode_audio(&up_buf)).await {
-                        break 'run BridgeEnd::WsError(e);
+                    if protocol.hold_uplink() {
+                        held.extend(up_buf.iter().copied());
+                        if held.len() > held_max {
+                            let excess = held.len() - held_max;
+                            held.drain(..excess);
+                        }
+                    } else {
+                        let mut msgs = Vec::new();
+                        if !held.is_empty() {
+                            debug!(samples = held.len(), "realtime: replaying held uplink");
+                            let chunk = in_rate as usize * REPLAY_CHUNK_MS / 1000;
+                            let backlog: Vec<i16> = held.drain(..).collect();
+                            for c in backlog.chunks(chunk) {
+                                msgs.extend(protocol.encode_audio(c));
+                            }
+                        }
+                        msgs.extend(protocol.encode_audio(&up_buf));
+                        if let Err(e) = send_all(&mut ws_tx, msgs).await {
+                            break 'run BridgeEnd::WsError(e);
+                        }
                     }
                 } else if Instant::now() >= ready_deadline {
                     break 'run BridgeEnd::ReadyTimeout;
@@ -290,6 +316,12 @@ pub async fn run_bridge(
                     }
                     _ => Vec::new(),
                 };
+                let reactions = protocol.take_uplink();
+                if !reactions.is_empty()
+                    && let Err(e) = send_all(&mut ws_tx, reactions).await
+                {
+                    break 'run BridgeEnd::WsError(e);
+                }
                 for ev in events {
                     match ev {
                         DownlinkEvent::SessionReady => {

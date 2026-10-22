@@ -120,7 +120,7 @@ impl RealtimeProtocol for Doubao {
         vec![UplinkMessage::json(ev)]
     }
 
-    fn greeting(&self) -> Vec<UplinkMessage> {
+    fn greeting(&mut self) -> Vec<UplinkMessage> {
         match &self.greeting {
             Some(text) => vec![UplinkMessage::json(json!({
                 "type": "speech_text_buffer.commit",
@@ -165,7 +165,7 @@ impl RealtimeProtocol for Doubao {
         vec![UplinkMessage::json(json!({"type": "session.close"}))]
     }
 
-    fn decode_text(&self, text: &str) -> Vec<DownlinkEvent> {
+    fn decode_text(&mut self, text: &str) -> Vec<DownlinkEvent> {
         let Ok(v) = serde_json::from_str::<Value>(text) else {
             return Vec::new();
         };
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn greeting_audio_cancel_close() {
-        let p = proto("greeting='您好，请问有什么可以帮您？'");
+        let mut p = proto("greeting='您好，请问有什么可以帮您？'");
         assert_eq!(
             json_of(&p.greeting()[0]),
             json!({"type": "speech_text_buffer.commit", "text": "您好，请问有什么可以帮您？"})
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn decodes_doc_examples() {
-        let p = proto("");
+        let mut p = proto("");
         let delta = pcm_b64(&[100, -100, 7]);
         let cases: Vec<(String, Vec<DownlinkEvent>)> = vec![
             (

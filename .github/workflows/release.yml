@@ -1,0 +1,92 @@
+name: Release
+
+# 打 tag v* 触发:各平台二进制上传到 GitHub Release + 多架构镜像推 ghcr.io/<owner>/sip2agent:<版本>
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-14, target: aarch64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --bin sip2agent --target ${{ matrix.target }}
+      - name: package
+        shell: bash
+        run: |
+          name=sip2agent-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir -p dist/$name
+          cp target/${{ matrix.target }}/release/sip2agent config.example.toml README.md LICENSE dist/$name/
+          tar -C dist -czf dist/$name.tar.gz $name
+          (cd dist && shasum -a 256 $name.tar.gz > $name.tar.gz.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz*
+
+  release:
+    name: publish release
+    runs-on: ubuntu-latest
+    needs: binaries
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  docker:
+    name: docker (amd64 + arm64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: CARGO_MIRROR=
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

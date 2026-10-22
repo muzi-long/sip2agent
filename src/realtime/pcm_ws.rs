@@ -58,7 +58,7 @@ impl RealtimeProtocol for PcmWs {
     fn session_open(&self) -> Vec<UplinkMessage> {
         Vec::new()
     }
-    fn greeting(&self) -> Vec<UplinkMessage> {
+    fn greeting(&mut self) -> Vec<UplinkMessage> {
         Vec::new()
     }
     fn encode_audio(&self, pcm: &[i16]) -> Vec<UplinkMessage> {
@@ -73,7 +73,7 @@ impl RealtimeProtocol for PcmWs {
     fn close(&self) -> Vec<UplinkMessage> {
         Vec::new()
     }
-    fn decode_text(&self, text: &str) -> Vec<DownlinkEvent> {
+    fn decode_text(&mut self, text: &str) -> Vec<DownlinkEvent> {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
             return Vec::new();
         };
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn downlink_binary_and_control_text() {
-        let p = PcmWs::new(&agent(""), None);
+        let mut p = PcmWs::new(&agent(""), None);
         assert_eq!(
             p.decode_binary(&[7, 0, 0, 0]),
             vec![DownlinkEvent::Audio(vec![7, 0])]
