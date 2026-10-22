@@ -7,6 +7,7 @@ use common::*;
 use futures::{SinkExt, StreamExt};
 use serde_json::json;
 use sip2agent::audio::g711::G711;
+use sip2agent::config::Config;
 use sip2agent::uac::{UacOptions, run};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -118,6 +119,82 @@ async fn source_allowlist_403_or_allowed() {
     .unwrap();
     assert_eq!(r.status, 200);
     assert!(r.rtp_received > 0, "{r:?}");
+    shutdown.cancel();
+}
+
+/// Reload (what SIGHUP triggers): new calls follow the new routes / allow
+/// list / RTP timeout, while a call in progress keeps the config it was
+/// routed with (its agent being removed or its timeout shortened does not
+/// affect it).
+#[tokio::test]
+async fn reload_applies_to_new_calls_only() {
+    let (addr, shutdown, shared) = start_server_shared(&base_config(32700, 10, ECHO)).await;
+
+    // In-progress call on 9000 without RTP: only its own 10 s timeout applies.
+    let ongoing = tokio::spawn(run(UacOptions {
+        server: addr,
+        to: "9000".into(),
+        send_rtp: false,
+        duration: Duration::from_secs(3),
+        ..Default::default()
+    }));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Reload 1: 9000 removed, echo now on 9100, RTP timeout 1 s.
+    let echo_9100 = ECHO
+        .replace("9000", "9100")
+        .replace("name = \"echo\"", "name = \"echo2\"");
+    let report = shared.apply(Config::parse(&base_config(32700, 1, &echo_9100)).unwrap());
+    assert!(report.restart_required.is_empty(), "{report:?}");
+    assert_eq!(
+        report.changed,
+        vec!["agents(+echo2,-echo)", "rtp.timeout_secs"]
+    );
+    let r = run(UacOptions {
+        server: addr,
+        to: "9000".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(r.status, 404, "old route gone for new calls");
+    let r = run(UacOptions {
+        server: addr,
+        to: "9100".into(),
+        duration: Duration::from_millis(600),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(r.status, 200);
+    assert!(r.rtp_received > 0, "{r:?}");
+
+    // Reload 2: allow list that excludes loopback → new calls get 403.
+    let blocked = base_config(32700, 1, &echo_9100).replacen(
+        "listen = \"127.0.0.1:0\"",
+        "listen = \"127.0.0.1:0\"\nallow = [\"10.0.0.0/8\"]",
+        1,
+    );
+    let report = shared.apply(Config::parse(&blocked).unwrap());
+    assert_eq!(report.changed, vec!["sip.allow"]);
+    let r = run(UacOptions {
+        server: addr,
+        to: "9100".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(r.status, 403);
+
+    // The call that started before both reloads ran its full 3 s: its agent
+    // was removed and the new 1 s RTP timeout would have hung it up.
+    let r = ongoing.await.unwrap().unwrap();
+    assert_eq!(r.status, 200);
+    assert!(
+        !r.remote_hangup,
+        "in-progress call must keep its config: {r:?}"
+    );
+    assert!(r.local_hangup, "{r:?}");
     shutdown.cancel();
 }
 

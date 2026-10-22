@@ -1,5 +1,8 @@
 # sip2agent 配置示例。复制为 config.toml 后按需修改。
 # 启动:sip2agent -c config.toml      校验:sip2agent -c config.toml --check
+# 热加载:改完后 kill -HUP <pid>(或 docker kill -s HUP sip2agent),只影响新呼入。
+#   可热加载:[[agent]] 全部字段、sip.allow、rtp.timeout_secs、log.level
+#   需要重启:sip.listen / tcp / external_ip / user_agent、rtp.bind_ip / port_min / port_max
 
 [sip]
 # SIP 监听地址(UDP 必开)

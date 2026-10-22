@@ -77,7 +77,7 @@ impl Default for RtpConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LogConfig {
     /// tracing EnvFilter directive, e.g. `info` or `sip2agent=debug,info`.
@@ -90,6 +90,18 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             level: default_log_level(),
+        }
+    }
+}
+
+impl LogConfig {
+    /// EnvFilter directive for `level`. rsipstack logs every raw SIP message
+    /// at INFO, so keep it at WARN unless the directive mentions it explicitly.
+    pub fn directive(&self) -> String {
+        if self.level.contains("rsipstack") {
+            self.level.clone()
+        } else {
+            format!("{},rsipstack=warn", self.level)
         }
     }
 }
@@ -130,7 +142,7 @@ pub struct ToolDef {
     pub parameters: serde_json::Value,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub name: String,
@@ -315,6 +327,129 @@ impl Config {
     }
 }
 
+/// What a reload changed, and which restart-only fields it had to ignore.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReloadReport {
+    /// Restart-required fields whose value differs in the new file (kept old).
+    pub restart_required: Vec<&'static str>,
+    /// Reloadable sections that changed, e.g. `agents(+b,-a,~c)`, `sip.allow`.
+    pub changed: Vec<String>,
+    /// New `log.level` when it changed (the caller owns the log filter).
+    pub log_level: Option<LogConfig>,
+}
+
+/// Merge a freshly loaded config into the running one.
+///
+/// Reloadable: every `[[agent]]` field, `sip.allow`, `rtp.timeout_secs`,
+/// `log.level`. Restart-required: `sip.listen` / `sip.tcp` /
+/// `sip.external_ip` / `sip.user_agent` / `rtp.bind_ip` / `rtp.port_min` /
+/// `rtp.port_max` — the running server keeps the OLD values for these, so the
+/// effective config is old listener + new everything else. A new config
+/// field must be classified here (and covered by `reload_*` tests).
+pub fn merge_reload(old: &Config, mut new: Config) -> (Config, ReloadReport) {
+    let mut report = ReloadReport::default();
+    macro_rules! keep_old {
+        ($($path:ident).+, $name:literal) => {
+            if old.$($path).+ != new.$($path).+ {
+                report.restart_required.push($name);
+                new.$($path).+ = old.$($path).+.clone();
+            }
+        };
+    }
+    keep_old!(sip.listen, "sip.listen");
+    keep_old!(sip.tcp, "sip.tcp");
+    keep_old!(sip.external_ip, "sip.external_ip");
+    keep_old!(sip.user_agent, "sip.user_agent");
+    keep_old!(rtp.bind_ip, "rtp.bind_ip");
+    keep_old!(rtp.port_min, "rtp.port_min");
+    keep_old!(rtp.port_max, "rtp.port_max");
+
+    let name_set =
+        |c: &Config| -> Vec<String> { c.agents.iter().map(|a| a.name.clone()).collect() };
+    let (old_names, new_names) = (name_set(old), name_set(&new));
+    let mut diff = Vec::new();
+    for n in new_names.iter().filter(|n| !old_names.contains(n)) {
+        diff.push(format!("+{n}"));
+    }
+    for n in old_names.iter().filter(|n| !new_names.contains(n)) {
+        diff.push(format!("-{n}"));
+    }
+    for a in &new.agents {
+        if let Some(o) = old.agents.iter().find(|o| o.name == a.name)
+            && o != a
+        {
+            diff.push(format!("~{}", a.name));
+        }
+    }
+    if !diff.is_empty() {
+        report.changed.push(format!("agents({})", diff.join(",")));
+    }
+    if old.sip.allow != new.sip.allow {
+        report.changed.push("sip.allow".into());
+    }
+    if old.rtp.timeout_secs != new.rtp.timeout_secs {
+        report.changed.push("rtp.timeout_secs".into());
+    }
+    if old.log.level != new.log.level {
+        report.changed.push("log.level".into());
+        report.log_level = Some(new.log.clone());
+    }
+    (new, report)
+}
+
+/// The running configuration, swapped atomically on reload (SIGHUP).
+///
+/// Readers take an `Arc<Config>` snapshot per request; a call keeps the
+/// snapshot it was routed with for its whole life, so reloads only affect
+/// new incoming requests.
+pub struct SharedConfig {
+    current: std::sync::RwLock<std::sync::Arc<Config>>,
+}
+
+impl SharedConfig {
+    pub fn new(cfg: Config) -> Self {
+        Self {
+            current: std::sync::RwLock::new(std::sync::Arc::new(cfg)),
+        }
+    }
+
+    /// Current snapshot.
+    pub fn load(&self) -> std::sync::Arc<Config> {
+        self.current.read().expect("config lock").clone()
+    }
+
+    /// Re-read and validate `path`, then apply it. On error the running
+    /// config is left untouched.
+    pub fn reload_file(&self, path: &Path) -> Result<ReloadReport> {
+        let new = Config::load(path)?;
+        Ok(self.apply(new))
+    }
+
+    /// Apply an already-validated config (merge + atomic swap + log summary).
+    pub fn apply(&self, new: Config) -> ReloadReport {
+        let mut guard = self.current.write().expect("config lock");
+        let (merged, report) = merge_reload(&guard, new);
+        if !report.restart_required.is_empty() {
+            tracing::warn!(
+                fields = %report.restart_required.join(","),
+                "config reload: these fields changed but need a restart; keeping the running values"
+            );
+        }
+        let names: Vec<&str> = merged.agents.iter().map(|a| a.name.as_str()).collect();
+        tracing::info!(
+            agents = %names.join(","),
+            allow = merged.sip.allow.len(),
+            changed = %if report.changed.is_empty() { "none".to_string() } else { report.changed.join(" ") },
+            "config reloaded (applies to new calls; calls in progress keep their config)"
+        );
+        if report.changed.iter().any(|c| c == "sip.allow") && merged.sip.allow.is_empty() {
+            tracing::warn!("sip.allow is now empty: ANY source can place calls");
+        }
+        *guard = std::sync::Arc::new(merged);
+        report
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +559,98 @@ provider = "echo"
             &cfg.sip.allow,
             "203.0.113.8".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn reload_keeps_restart_only_fields_and_applies_the_rest() {
+        let old = Config::parse(SAMPLE).unwrap();
+        let new_text = SAMPLE
+            .replace("127.0.0.1:5070", "127.0.0.1:6000")
+            .replace(
+                "external_ip = \"203.0.113.5\"",
+                "external_ip = \"203.0.113.9\"\nallow = [\"10.0.0.0/8\"]",
+            )
+            .replace("port_max = 30010", "port_max = 30020\ntimeout_secs = 5")
+            .replace("greeting = \"您好\"", "greeting = \"你好\"")
+            .replace(
+                "name = \"echo\"\nmatch = \"9000\"",
+                "name = \"echo2\"\nmatch = \"9001\"",
+            );
+        let (merged, report) = merge_reload(&old, Config::parse(&new_text).unwrap());
+        assert_eq!(
+            report.restart_required,
+            vec!["sip.listen", "sip.external_ip", "rtp.port_max"]
+        );
+        // Restart-only: old values kept.
+        assert_eq!(merged.sip.listen.port(), 5070);
+        assert_eq!(merged.sip.external_ip, old.sip.external_ip);
+        assert_eq!(merged.rtp.port_max, 30010);
+        // Reloadable: applied.
+        assert_eq!(merged.sip.allow.len(), 1);
+        assert_eq!(merged.rtp.timeout_secs, 5);
+        assert!(
+            merged.match_agent("9000").unwrap().name == "qwen",
+            "9000 now falls to *"
+        );
+        assert_eq!(merged.match_agent("9001").unwrap().name, "echo2");
+        assert_eq!(
+            merged.match_agent("x").unwrap().greeting.as_deref(),
+            Some("你好")
+        );
+        assert_eq!(
+            report.changed,
+            vec![
+                "agents(+echo2,-echo,~qwen)",
+                "sip.allow",
+                "rtp.timeout_secs"
+            ]
+        );
+        assert!(report.log_level.is_none());
+    }
+
+    #[test]
+    fn reload_no_change_and_log_level() {
+        let old = Config::parse(SAMPLE).unwrap();
+        let (_, report) = merge_reload(&old, Config::parse(SAMPLE).unwrap());
+        assert_eq!(report, ReloadReport::default());
+        let (_, report) = merge_reload(
+            &old,
+            Config::parse(&format!("[log]\nlevel = \"debug\"\n{SAMPLE}")).unwrap(),
+        );
+        assert_eq!(report.changed, vec!["log.level"]);
+        assert_eq!(
+            report.log_level.unwrap().directive(),
+            "debug,rsipstack=warn"
+        );
+    }
+
+    #[test]
+    fn shared_config_rejects_invalid_and_swaps_valid() {
+        let dir = std::env::temp_dir().join(format!("sip2agent-reload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, SAMPLE).unwrap();
+        let shared = SharedConfig::new(Config::load(&path).unwrap());
+        let before = shared.load();
+
+        // Invalid file: error, running config untouched.
+        std::fs::write(&path, "[[agent]]\nname='p'\nmatch='1'\nprovider='pcm_ws'\n").unwrap();
+        assert!(shared.reload_file(&path).is_err());
+        assert!(std::sync::Arc::ptr_eq(&before, &shared.load()));
+        std::fs::write(&path, "not toml [").unwrap();
+        assert!(shared.reload_file(&path).is_err());
+
+        // Valid file: swapped; the old snapshot is unchanged for its holders.
+        std::fs::write(
+            &path,
+            SAMPLE.replace("match = \"9000\"", "match = \"9100\""),
+        )
+        .unwrap();
+        let report = shared.reload_file(&path).unwrap();
+        assert_eq!(report.changed, vec!["agents(~echo)"]);
+        assert_eq!(shared.load().match_agent("9100").unwrap().name, "echo");
+        assert_eq!(before.match_agent("9000").unwrap().name, "echo");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

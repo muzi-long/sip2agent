@@ -4,7 +4,7 @@
 
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
-use sip2agent::config::Config;
+use sip2agent::config::{Config, SharedConfig};
 use sip2agent::sip::SipServer;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -180,16 +180,27 @@ pub async fn mock_ws() -> (String, mpsc::UnboundedReceiver<WsConn>) {
 
 /// Start sip2agent in-process on an ephemeral port.
 pub async fn start_server(config: &str) -> (SocketAddr, CancellationToken) {
+    let (addr, shutdown, _) = start_server_shared(config).await;
+    (addr, shutdown)
+}
+
+/// Like [`start_server`], also returning the live config for reload tests.
+pub async fn start_server_shared(
+    config: &str,
+) -> (SocketAddr, CancellationToken, Arc<SharedConfig>) {
     sip2agent::install_crypto_provider();
     let cfg = Config::parse(config).expect("config");
-    let server = SipServer::bind(Arc::new(cfg)).await.expect("bind");
+    let server = SipServer::bind_shared(Arc::new(SharedConfig::new(cfg)))
+        .await
+        .expect("bind");
     let addr = server.local_addr();
+    let shared = server.shared_config();
     let shutdown = CancellationToken::new();
     let s = shutdown.clone();
     tokio::spawn(async move {
         server.run(s).await.ok();
     });
-    (addr, shutdown)
+    (addr, shutdown, shared)
 }
 
 pub fn is_silent(pcm: &[i16]) -> bool {

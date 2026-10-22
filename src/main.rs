@@ -1,10 +1,12 @@
 use anyhow::Result;
-use sip2agent::config::Config;
+use sip2agent::config::{Config, SharedConfig};
 use sip2agent::sip::SipServer;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Registry, reload};
 
 const USAGE: &str = "usage: sip2agent [-c|--config <config.toml>] [--check]";
 
@@ -35,15 +37,16 @@ async fn main() -> Result<()> {
     }
 
     let cfg = Config::load(&config_path)?;
-    // rsipstack logs every raw SIP message at INFO; keep it at WARN unless
-    // the directive mentions it explicitly.
-    let directive = if cfg.log.level.contains("rsipstack") {
-        cfg.log.level.clone()
-    } else {
-        format!("{},rsipstack=warn", cfg.log.level)
+    // RUST_LOG, when set, wins over `log.level` — at startup and on reload.
+    let (filter, rust_log) = match EnvFilter::try_from_default_env() {
+        Ok(f) => (f, true),
+        Err(_) => (EnvFilter::new(cfg.log.directive()), false),
     };
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(directive));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let (filter, filter_handle) = reload::Layer::new(filter);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
     if check_only {
         println!("config OK: {} agent(s)", cfg.agents.len());
@@ -57,7 +60,14 @@ async fn main() -> Result<()> {
     }
 
     sip2agent::install_crypto_provider();
-    let server = SipServer::bind(Arc::new(cfg)).await?;
+    let shared = Arc::new(SharedConfig::new(cfg));
+    let server = SipServer::bind_shared(shared.clone()).await?;
+    tokio::spawn(reload_on_sighup(
+        shared,
+        config_path,
+        filter_handle,
+        rust_log,
+    ));
     let shutdown = CancellationToken::new();
     {
         let shutdown = shutdown.clone();
@@ -83,4 +93,63 @@ async fn wait_for_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// SIGHUP → re-read the config file. Invalid files are rejected (running
+/// config kept); valid ones apply to new calls only.
+#[cfg(unix)]
+async fn reload_on_sighup(
+    shared: Arc<SharedConfig>,
+    path: PathBuf,
+    filter: reload::Handle<EnvFilter, Registry>,
+    rust_log: bool,
+) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let Ok(mut hup) = signal(SignalKind::hangup()) else {
+        tracing::warn!("cannot install SIGHUP handler: config reload disabled");
+        return;
+    };
+    while hup.recv().await.is_some() {
+        tracing::info!(path = %path.display(), "SIGHUP: reloading config");
+        let report = match shared.reload_file(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    error = format!("{e:#}"),
+                    "config reload failed; keeping the running config"
+                );
+                continue;
+            }
+        };
+        let Some(log) = report.log_level else {
+            continue;
+        };
+        if rust_log {
+            tracing::info!(
+                "log.level changed but RUST_LOG is set and takes precedence; log filter unchanged"
+            );
+            continue;
+        }
+        match EnvFilter::try_new(log.directive()) {
+            Ok(f) => {
+                if let Err(e) = filter.reload(f) {
+                    tracing::warn!(error = %e, "log filter reload failed");
+                } else {
+                    tracing::info!(level = %log.level, "log level updated");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, level = %log.level, "invalid log.level; log filter unchanged")
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn reload_on_sighup(
+    _shared: Arc<SharedConfig>,
+    _path: PathBuf,
+    _filter: reload::Handle<EnvFilter, Registry>,
+    _rust_log: bool,
+) {
 }

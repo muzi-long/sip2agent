@@ -22,9 +22,12 @@ sip2agent 是一个单二进制的 SIP 被叫端(UAS)。它接起电话,把 G.71
 
 - **Docker 镜像**:main 分支每次推送都会更新 `latest`,发版时额外打版本号 tag,比如 `0.1.0`。
   ```bash
+  mkdir -p conf && cp config.example.toml conf/config.toml   # 按需修改
   docker run -d --name sip2agent --network host \
-    -v $PWD/config.toml:/app/config.toml ghcr.io/muzi-long/sip2agent:latest
+    -v $PWD/conf:/app/conf ghcr.io/muzi-long/sip2agent:latest \
+    sip2agent -c /app/conf/config.toml
   ```
+  挂载的是**目录**而不是单个文件,这样改完配置能热加载(原因见[热加载配置](#热加载配置))。镜像默认命令仍读 `/app/config.toml`,原来按单文件挂载的用法不受影响。
   国内网络可用 cnb.cool 上同名仓库 CI 同步构建的镜像(同样有 `latest` tag)。
 - **预编译二进制**:到 [GitHub Releases](https://github.com/muzi-long/sip2agent/releases) 下载 linux x86_64 / linux aarch64 / macOS arm64 的 tar.gz,解压即可运行。
 - **源码编译**:`cargo build --release`(需要 Rust 1.92+),产物在 `target/release/sip2agent`。
@@ -116,6 +119,23 @@ sip2agent **没有 SIP 鉴权**。每一通电话都会消耗厂商额度,暴露
 - **RTP 来源锁定**:每通电话只接收一个来源的 RTP(优先 SDP 里的地址,否则第一个有效来源),其他来源的包直接丢弃,防止往通话里注入音频。只有原来源静默 1 秒以上、新来源连续稳定发包时才会切换;re-INVITE 换了媒体地址会重新锁定。
 - **key 的存放**:用 `api_key_env` 从环境变量读取,不要写进配置文件提交到仓库。key 只会出现在 WebSocket 握手头里,不会进日志。
 
+## 热加载配置
+
+改完配置文件后,给进程发 SIGHUP 即可生效,不用重启,也不会中断正在进行的通话:
+
+```bash
+kill -HUP <pid>                       # 直接运行时
+docker kill -s HUP sip2agent          # Docker 中运行时
+```
+
+- **先校验再生效**:新文件校验不通过(TOML 写错、字段非法等)时,日志打 ERROR,继续使用原配置。
+- **只影响新呼入**:正在进行的通话一直用它接通那一刻的配置,即使它的 agent 被删掉或改了也不受影响。
+- **可以热加载的**:`[[agent]]` 的全部字段(路由、提示词、音色、工具、webhook、key 等)、`sip.allow`、`rtp.timeout_secs`、`log.level`。设置了 `RUST_LOG` 环境变量时它优先,`log.level` 的修改不生效。
+- **需要重启的**:`sip.listen`、`sip.tcp`、`sip.external_ip`、`sip.user_agent`、`rtp.bind_ip`、`rtp.port_min`、`rtp.port_max`。热加载时这些字段的改动会被忽略(继续用启动时的值),并打一条 WARN 列出需要重启的字段;其余改动照常生效。
+- 每次加载成功都会打一条 INFO,列出当前 agent、`sip.allow` 条数和这次改动了哪些部分。
+
+**Docker 单文件挂载的坑**:如果用 `-v $PWD/config.toml:/app/config.toml` 挂载单个文件,vim、多数 IDE、`sed -i` 这类"先写临时文件再改名"的保存方式会在宿主机上换掉文件的 inode,容器里看到的仍是**旧文件**,SIGHUP 读到的也是旧内容。请挂载目录(`-v $PWD/conf:/app/conf` 加 `-c /app/conf/config.toml`),见上面的[安装](#安装)示例。
+
 ## 通话流程
 
 1. **路由**:收到 INVITE 后,先按 `sip.allow` 检查来源,不通过回 **403**;再按被叫号码匹配 `[[agent]].match`,都不中就找 `match = "*"`,仍没有回 **404**。
@@ -151,7 +171,7 @@ sip2agent **没有 SIP 鉴权**。每一通电话都会消耗厂商额度,暴露
 
 ### `[log]`
 
-`level`:tracing EnvFilter 语法,默认 `info`。`RUST_LOG` 环境变量优先。rsipstack 的 SIP 报文日志默认压到 warn,要看报文就写 `info,rsipstack=info`。
+`level`:tracing EnvFilter 语法,默认 `info`,可热加载。`RUST_LOG` 环境变量优先(此时修改 `level` 不生效)。rsipstack 的 SIP 报文日志默认压到 warn,要看报文就写 `info,rsipstack=info`。
 
 ### `[[agent]]`
 

@@ -7,7 +7,7 @@
 //! media until either side ends → BYE (when we end) → call-end webhook.
 
 use crate::call::{self, MediaEnd, MediaParams};
-use crate::config::Config;
+use crate::config::{Config, SharedConfig};
 use crate::rtp::{self, PortAllocator};
 use crate::sdp;
 use crate::webhook::{self, CallEndReport};
@@ -47,7 +47,7 @@ struct CallHandle {
 type Calls = Arc<Mutex<HashMap<String, CallHandle>>>;
 
 pub struct SipServer {
-    cfg: Arc<Config>,
+    cfg: Arc<SharedConfig>,
     endpoint: Endpoint,
     dialog_layer: Arc<DialogLayer>,
     ports: Arc<PortAllocator>,
@@ -59,6 +59,13 @@ pub struct SipServer {
 impl SipServer {
     /// Bind SIP transports (UDP, optional TCP).
     pub async fn bind(cfg: Arc<Config>) -> Result<Self> {
+        Self::bind_shared(Arc::new(SharedConfig::new((*cfg).clone()))).await
+    }
+
+    /// Bind with a reloadable config: listener / RTP range come from the
+    /// snapshot at bind time; [`SharedConfig::apply`] later swaps the rest.
+    pub async fn bind_shared(shared: Arc<SharedConfig>) -> Result<Self> {
+        let cfg = shared.load();
         let cancel = CancellationToken::new();
         let transport_layer = TransportLayer::new(cancel.clone());
         let listen = cfg.sip.listen;
@@ -110,7 +117,7 @@ impl SipServer {
             info!(allow = %allow.join(","), "SIP source allowlist enabled");
         }
         Ok(Self {
-            cfg,
+            cfg: shared,
             endpoint,
             dialog_layer,
             ports,
@@ -122,6 +129,11 @@ impl SipServer {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The live config (for reloads, e.g. on SIGHUP).
+    pub fn shared_config(&self) -> Arc<SharedConfig> {
+        self.cfg.clone()
     }
 
     /// Run until `shutdown` fires; active calls get BYE before returning.
@@ -176,7 +188,7 @@ impl SipServer {
 }
 
 struct InviteCtx {
-    cfg: Arc<Config>,
+    cfg: Arc<SharedConfig>,
     dialog_layer: Arc<DialogLayer>,
     ports: Arc<PortAllocator>,
     calls: Calls,
@@ -193,9 +205,11 @@ async fn incoming_loop(mut incoming: TransactionReceiver, ctx: Arc<InviteCtx>) {
             .ok()
             .and_then(|t| t.tag().ok().flatten())
             .is_some();
-        if !in_dialog && method != Method::Ack && !ctx.cfg.sip.allow.is_empty() {
+        // One snapshot per request: a call keeps the config it was routed with.
+        let cfg = ctx.cfg.load();
+        if !in_dialog && method != Method::Ack && !cfg.sip.allow.is_empty() {
             let src = source_ip(&tx.original);
-            if !src.is_some_and(|ip| crate::acl::allowed(&ctx.cfg.sip.allow, ip)) {
+            if !src.is_some_and(|ip| crate::acl::allowed(&cfg.sip.allow, ip)) {
                 warn!(source = ?src, %method, "request from source not in sip.allow: 403");
                 tokio::spawn(async move {
                     tx.reply(StatusCode::Forbidden).await.ok();
@@ -204,7 +218,7 @@ async fn incoming_loop(mut incoming: TransactionReceiver, ctx: Arc<InviteCtx>) {
             }
         }
         if method == Method::Invite && !in_dialog {
-            on_invite(&ctx, tx).await;
+            on_invite(&ctx, cfg, tx).await;
             continue;
         }
         match ctx.dialog_layer.match_dialog(&tx) {
@@ -250,7 +264,7 @@ fn user_of(uri: &rsipstack::sip::Uri) -> String {
     uri.user().unwrap_or_default().to_string()
 }
 
-async fn on_invite(ctx: &Arc<InviteCtx>, mut tx: Transaction) {
+async fn on_invite(ctx: &Arc<InviteCtx>, cfg: Arc<Config>, mut tx: Transaction) {
     let called = user_of(&tx.original.uri);
     let from = tx
         .original
@@ -265,7 +279,7 @@ async fn on_invite(ctx: &Arc<InviteCtx>, mut tx: Transaction) {
         .map(|c| c.value().to_string())
         .unwrap_or_default();
 
-    let Some(agent) = ctx.cfg.match_agent(&called).cloned() else {
+    let Some(agent) = cfg.match_agent(&called).cloned() else {
         info!(%call_id, %from, to = %called, "no agent for called number → 404");
         tokio::spawn(async move {
             tx.reply(StatusCode::NotFound).await.ok();
@@ -329,6 +343,7 @@ async fn on_invite(ctx: &Arc<InviteCtx>, mut tx: Transaction) {
             from,
             to: called,
             agent: Arc::new(agent),
+            cfg,
         };
         run_call(&ctx, dialog.clone(), info, offer, slots).await;
         ctx.calls.lock().expect("calls lock").remove(&dialog_key);
@@ -341,6 +356,8 @@ struct CallInfo {
     from: String,
     to: String,
     agent: Arc<crate::config::AgentConfig>,
+    /// Config snapshot taken when the INVITE arrived (unaffected by reloads).
+    cfg: Arc<Config>,
 }
 
 fn reject(dialog: &InviteDialog, code: StatusCode) {
@@ -350,12 +367,12 @@ fn reject(dialog: &InviteDialog, code: StatusCode) {
 }
 
 /// Pick the IP we advertise in SDP.
-fn advertised_ip(ctx: &InviteCtx, remote: Option<SocketAddr>) -> IpAddr {
-    if let Some(ip) = ctx.cfg.sip.external_ip {
+fn advertised_ip(ctx: &InviteCtx, cfg: &Config, remote: Option<SocketAddr>) -> IpAddr {
+    if let Some(ip) = cfg.sip.external_ip {
         return ip;
     }
-    if !ctx.cfg.rtp.bind_ip.is_unspecified() {
-        return ctx.cfg.rtp.bind_ip;
+    if !cfg.rtp.bind_ip.is_unspecified() {
+        return cfg.rtp.bind_ip;
     }
     if let Some(r) = remote
         && let Ok(s) = std::net::UdpSocket::bind(SocketAddr::new(
@@ -419,7 +436,7 @@ async fn run_call(
     }
 
     let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
-    let ip = advertised_ip(ctx, offer.remote_rtp);
+    let ip = advertised_ip(ctx, &info.cfg, offer.remote_rtp);
     let answer = sdp::build_answer(ip, local_port, offer.codec, rand::random::<u32>() as u64);
     *answer_slot.lock().expect("answer lock") = Some(answer.clone());
     if let Err(e) = dialog.accept(
@@ -446,7 +463,7 @@ async fn run_call(
     *rtp_slot.lock().expect("rtp lock") = Some(rtp_session.control());
 
     let rtp_timeout =
-        (ctx.cfg.rtp.timeout_secs > 0).then(|| Duration::from_secs(ctx.cfg.rtp.timeout_secs));
+        (info.cfg.rtp.timeout_secs > 0).then(|| Duration::from_secs(info.cfg.rtp.timeout_secs));
     let outcome = call::run_media(
         MediaParams {
             call_id: call_id.clone(),

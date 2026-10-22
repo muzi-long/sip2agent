@@ -24,8 +24,8 @@ SIP2AGENT_QWEN_LIVE=1 SIP2AGENT_LIVE_DIR=<wav目录> QWEN_URL=wss://... DASHSCOP
 
 | 路径 | 职责 |
 |---|---|
-| `src/main.rs` | 参数、日志、信号、启动 `SipServer` |
-| `src/config.rs` | `config.toml` 结构、校验、按被叫路由(精确 > `*`) |
+| `src/main.rs` | 参数、日志(reload 句柄)、信号(SIGINT/SIGTERM 停机,SIGHUP 热加载)、启动 `SipServer` |
+| `src/config.rs` | `config.toml` 结构、校验、按被叫路由(精确 > `*`);`SharedConfig`(热加载原子替换)+ `merge_reload`(重启项保留旧值、报告改动) |
 | `src/sip.rs` | rsipstack UAS:INVITE/ACK/BYE/CANCEL、`sip.allow` 来源检查(403)、404/488/503、re-INVITE/UPDATE 回当前 SDP、状态循环、停机 BYE |
 | `src/acl.rs` | `sip.allow` 的 IP/CIDR 解析与匹配(自写,不引依赖) |
 | `src/sdp.rs` | offer 解析(按 offer 顺序取首个 PCMA/PCMU)、answer 生成 |
@@ -51,4 +51,5 @@ SIP2AGENT_QWEN_LIVE=1 SIP2AGENT_LIVE_DIR=<wav目录> QWEN_URL=wss://... DASHSCOP
 - **厂商协议必须以最新官方文档为准**:改适配器前重新核对官方文档(豆包 6561/2549778、6561/2549732 及官方 demo;阿里云 model-studio client-events / server-events),不要凭记忆或第三方博客;核对日期写进适配器头注释。
 - API key 只能出现在 WS 握手头里,不进日志、不进 URL、`Debug` 输出要脱敏。
 - 新增 `[[agent]]` 字段要同步 `config.example.toml`(有单测保证它可解析)和 README 配置表。
+- **热加载**:每个请求在 `incoming_loop` 取一次 `SharedConfig::load()` 快照,通话全程只用 `CallInfo.cfg` / `agent` 快照,**通话路径里不许再读 live 配置**。新增任何配置字段都必须在 `merge_reload` 里归类为"可热加载"或"需重启(保留旧值)",并补 `reload_*` 测试;改了要同步 README「热加载配置」和 `config.example.toml` 头注释。
 - 临时调试文件不要放进仓库。
