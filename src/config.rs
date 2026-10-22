@@ -33,6 +33,10 @@ pub struct SipConfig {
     pub external_ip: Option<IpAddr>,
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
+    /// Source-IP allowlist (IPs / CIDRs) for out-of-dialog requests, checked
+    /// against the packet source address. Empty = anyone may call.
+    #[serde(default)]
+    pub allow: Vec<crate::acl::IpNet>,
 }
 
 impl Default for SipConfig {
@@ -42,6 +46,7 @@ impl Default for SipConfig {
             tcp: false,
             external_ip: None,
             user_agent: default_user_agent(),
+            allow: Vec::new(),
         }
     }
 }
@@ -401,6 +406,24 @@ provider = "echo"
         );
         assert!(Config::parse("[[agent]]\nname='x'\nmatch='1'\nprovider='openai'\n").is_err());
         assert!(Config::parse("[sip]\nbogus = 1\n").is_err());
+        assert!(Config::parse("[sip]\nallow = [\"10.0.0.0/33\"]\n").is_err());
+        assert!(Config::parse("[sip]\nallow = [\"not-an-ip\"]\n").is_err());
+    }
+
+    #[test]
+    fn sip_allow_parses() {
+        assert!(Config::parse("").unwrap().sip.allow.is_empty());
+        let cfg =
+            Config::parse("[sip]\nallow = [\"10.0.0.0/8\", \"203.0.113.7\", \"::1\"]\n").unwrap();
+        assert_eq!(cfg.sip.allow.len(), 3);
+        assert!(crate::acl::allowed(
+            &cfg.sip.allow,
+            "203.0.113.7".parse().unwrap()
+        ));
+        assert!(!crate::acl::allowed(
+            &cfg.sip.allow,
+            "203.0.113.8".parse().unwrap()
+        ));
     }
 
     #[test]

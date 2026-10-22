@@ -86,6 +86,42 @@ m=audio 40000 RTP/AVP 9 101\r\na=rtpmap:9 G722/8000\r\na=rtpmap:101 telephone-ev
 }
 
 #[tokio::test]
+async fn source_allowlist_403_or_allowed() {
+    let with_allow = |allow: &str| {
+        base_config(32600, 10, ECHO).replacen(
+            "listen = \"127.0.0.1:0\"",
+            &format!("listen = \"127.0.0.1:0\"\nallow = {allow}"),
+            1,
+        )
+    };
+
+    let (addr, shutdown) = start_server(&with_allow(r#"["10.0.0.0/8", "2001:db8::/32"]"#)).await;
+    let r = run(UacOptions {
+        server: addr,
+        to: "9000".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(r.status, 403);
+    assert_eq!(r.rtp_received, 0);
+    shutdown.cancel();
+
+    let (addr, shutdown) = start_server(&with_allow(r#"["10.0.0.0/8", "127.0.0.0/8"]"#)).await;
+    let r = run(UacOptions {
+        server: addr,
+        to: "9000".into(),
+        duration: Duration::from_millis(600),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(r.status, 200);
+    assert!(r.rtp_received > 0, "{r:?}");
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn rtp_timeout_hangs_up_with_bye() {
     let (addr, shutdown) = start_server(&base_config(32200, 1, ECHO)).await;
     let t = Instant::now();

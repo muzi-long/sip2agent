@@ -9,6 +9,9 @@ tcp = false
 # 公网/对外 IP:写入 SDP c=/o= 以及 SIP Via/Contact(NAT 部署必填)
 # external_ip = "203.0.113.10"
 # user_agent = "sip2agent"
+# 来源 IP 白名单(IP 或 CIDR,支持 IPv6),按 SIP 包的真实来源地址判断,不在名单内回 403。
+# 不配 = 任何人都能拨入并消耗厂商额度(启动时会打 WARN),生产环境务必配置或用防火墙限制。
+# allow = ["10.0.0.0/8", "203.0.113.7"]
 
 [rtp]
 bind_ip = "0.0.0.0"

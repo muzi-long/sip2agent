@@ -97,6 +97,15 @@ impl SipServer {
             cfg.rtp.port_max,
         ));
         info!(%local_addr, tcp = cfg.sip.tcp, external_ip = ?cfg.sip.external_ip, "SIP listening");
+        if cfg.sip.allow.is_empty() {
+            warn!(
+                "sip.allow is empty: ANY source can place calls (and spend vendor quota); \
+                 set sip.allow or firewall the SIP port"
+            );
+        } else {
+            let allow: Vec<String> = cfg.sip.allow.iter().map(|n| n.to_string()).collect();
+            info!(allow = %allow.join(","), "SIP source allowlist enabled");
+        }
         Ok(Self {
             cfg,
             endpoint,
@@ -181,6 +190,16 @@ async fn incoming_loop(mut incoming: TransactionReceiver, ctx: Arc<InviteCtx>) {
             .ok()
             .and_then(|t| t.tag().ok().flatten())
             .is_some();
+        if !in_dialog && method != Method::Ack && !ctx.cfg.sip.allow.is_empty() {
+            let src = source_ip(&tx.original);
+            if !src.is_some_and(|ip| crate::acl::allowed(&ctx.cfg.sip.allow, ip)) {
+                warn!(source = ?src, %method, "request from source not in sip.allow: 403");
+                tokio::spawn(async move {
+                    tx.reply(StatusCode::Forbidden).await.ok();
+                });
+                continue;
+            }
+        }
         if method == Method::Invite && !in_dialog {
             on_invite(&ctx, tx).await;
             continue;
@@ -209,6 +228,18 @@ async fn incoming_loop(mut incoming: TransactionReceiver, ctx: Arc<InviteCtx>) {
                 });
             }
         }
+    }
+}
+
+/// Packet source IP of a received request. The transport layer stamps the real
+/// source into the top Via (`received=` when it differs from sent-by, which
+/// it then overwrites), so this is not spoofable via headers.
+fn source_ip(req: &rsipstack::sip::Request) -> Option<IpAddr> {
+    let via = req.via_header().ok()?;
+    let (_, hp) = rsipstack::transport::SipConnection::parse_target_from_via(via).ok()?;
+    match hp.host {
+        rsipstack::sip::Host::IpAddr(ip) => Some(ip),
+        _ => None,
     }
 }
 

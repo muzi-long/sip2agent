@@ -26,7 +26,8 @@ SIP2AGENT_QWEN_LIVE=1 SIP2AGENT_LIVE_DIR=<wav目录> QWEN_URL=wss://... DASHSCOP
 |---|---|
 | `src/main.rs` | 参数、日志、信号、启动 `SipServer` |
 | `src/config.rs` | `config.toml` 结构、校验、按被叫路由(精确 > `*`) |
-| `src/sip.rs` | rsipstack UAS:INVITE/ACK/BYE/CANCEL、404/488/503、re-INVITE/UPDATE 回当前 SDP、状态循环、停机 BYE |
+| `src/sip.rs` | rsipstack UAS:INVITE/ACK/BYE/CANCEL、`sip.allow` 来源检查(403)、404/488/503、re-INVITE/UPDATE 回当前 SDP、状态循环、停机 BYE |
+| `src/acl.rs` | `sip.allow` 的 IP/CIDR 解析与匹配(自写,不引依赖) |
 | `src/sdp.rs` | offer 解析(按 offer 顺序取首个 PCMA/PCMU)、answer 生成 |
 | `src/rtp.rs` | RTP 包、端口分配、对称 RTP、收包重组 160 样本帧、`MediaPort` |
 | `src/audio/g711.rs` / `resample.rs` | G.711;rustpbx 原样移植的线性重采样(勿改算法,保留署名头) |
@@ -45,6 +46,8 @@ SIP2AGENT_QWEN_LIVE=1 SIP2AGENT_LIVE_DIR=<wav目录> QWEN_URL=wss://... DASHSCOP
 - **上行节奏**:bridge 每 20 ms 发且只发一帧,静音也发(豆包靠上行保活,节奏偏离会报错)。不要改成"有音频才发"。唯一例外是适配器 `hold_uplink()`(Qwen 开场白期间)。
 - **适配器不做 IO、不计时**:WS 收发、计时、缓冲都在 `bridge.rs`;协议自身的状态机可以放适配器(如 Qwen 开场白),对服务端事件的回应走 `take_uplink()`。新厂商 = 新适配器 + 文档样例单测 + mock 全流程测试,能拿到 key 就加 env 门控的 live 测试。
 - **Qwen(qwen3.8-omni-flash-realtime)实测 2026-10-22 的结论,改之前先重测**:8 kHz 进出可用(不重采样);新会话裸 `response.create` 会被拒,开场白必须走"手动模式 + 原话指令 + commit 静音 → response.create → done 后切回 VAD"且期间暂存主叫音频(手动模式下发主叫音频服务端会断开);指令里必须给出原话并说明收到的是静音,否则模型会即兴发挥。
+- **厂商协议细节与实测结论写在 `docs/providers.md`**,改适配器时同步更新;README 只写使用层面的信息。
+- **来源检查只看 SIP 包真实来源**(rsipstack 写进顶层 Via 的 received/sent-by),不要改成信任 From/Contact 等可伪造的头。
 - **厂商协议必须以最新官方文档为准**:改适配器前重新核对官方文档(豆包 6561/2549778、6561/2549732 及官方 demo;阿里云 model-studio client-events / server-events),不要凭记忆或第三方博客;核对日期写进适配器头注释。
 - API key 只能出现在 WS 握手头里,不进日志、不进 URL、`Debug` 输出要脱敏。
 - 新增 `[[agent]]` 字段要同步 `config.example.toml`(有单测保证它可解析)和 README 配置表。
