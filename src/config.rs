@@ -15,6 +15,8 @@ pub struct Config {
     pub rtp: RtpConfig,
     #[serde(default)]
     pub log: LogConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
     #[serde(default, rename = "agent")]
     pub agents: Vec<AgentConfig>,
 }
@@ -91,6 +93,42 @@ impl Default for LogConfig {
         Self {
             level: default_log_level(),
         }
+    }
+}
+
+/// Local admin API (`sip2agent reload|stop|status` talk to it).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    /// HTTP listen address; empty string disables the admin API.
+    #[serde(default = "default_admin_listen")]
+    pub listen: String,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_admin_listen(),
+        }
+    }
+}
+
+pub const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:9060";
+
+fn default_admin_listen() -> String {
+    DEFAULT_ADMIN_LISTEN.to_string()
+}
+
+impl AdminConfig {
+    /// Parsed listen address; `None` when the admin API is disabled.
+    pub fn addr(&self) -> Result<Option<SocketAddr>> {
+        let s = self.listen.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        s.parse()
+            .map(Some)
+            .with_context(|| format!("admin.listen '{s}' is not an ip:port address"))
     }
 }
 
@@ -267,6 +305,7 @@ impl Config {
         if self.rtp.port_min > self.rtp.port_max {
             bail!("rtp.port_min must be <= rtp.port_max");
         }
+        self.admin.addr()?;
         let mut names = std::collections::HashSet::new();
         let mut matches = std::collections::HashSet::new();
         for a in &self.agents {
@@ -343,7 +382,7 @@ pub struct ReloadReport {
 /// Reloadable: every `[[agent]]` field, `sip.allow`, `rtp.timeout_secs`,
 /// `log.level`. Restart-required: `sip.listen` / `sip.tcp` /
 /// `sip.external_ip` / `sip.user_agent` / `rtp.bind_ip` / `rtp.port_min` /
-/// `rtp.port_max` — the running server keeps the OLD values for these, so the
+/// `rtp.port_max` / `admin.listen` — the running server keeps the OLD values for these, so the
 /// effective config is old listener + new everything else. A new config
 /// field must be classified here (and covered by `reload_*` tests).
 pub fn merge_reload(old: &Config, mut new: Config) -> (Config, ReloadReport) {
@@ -363,6 +402,7 @@ pub fn merge_reload(old: &Config, mut new: Config) -> (Config, ReloadReport) {
     keep_old!(rtp.bind_ip, "rtp.bind_ip");
     keep_old!(rtp.port_min, "rtp.port_min");
     keep_old!(rtp.port_max, "rtp.port_max");
+    keep_old!(admin.listen, "admin.listen");
 
     let name_set =
         |c: &Config| -> Vec<String> { c.agents.iter().map(|a| a.name.clone()).collect() };
@@ -622,6 +662,26 @@ provider = "echo"
             report.log_level.unwrap().directive(),
             "debug,rsipstack=warn"
         );
+    }
+
+    #[test]
+    fn admin_listen_default_disable_and_reload_keeps_it() {
+        let cfg = Config::parse("").unwrap();
+        assert_eq!(
+            cfg.admin.addr().unwrap(),
+            Some("127.0.0.1:9060".parse().unwrap())
+        );
+        let off = Config::parse("[admin]\nlisten = \"\"\n").unwrap();
+        assert_eq!(off.admin.addr().unwrap(), None);
+        assert!(Config::parse("[admin]\nlisten = \"localhost:9060\"\n").is_err());
+        assert!(Config::parse("[admin]\nport = 1\n").is_err());
+
+        let (merged, report) = merge_reload(
+            &cfg,
+            Config::parse("[admin]\nlisten = \"127.0.0.1:9999\"\n").unwrap(),
+        );
+        assert_eq!(report.restart_required, vec!["admin.listen"]);
+        assert_eq!(merged.admin.listen, "127.0.0.1:9060");
     }
 
     #[test]

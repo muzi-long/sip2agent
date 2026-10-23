@@ -118,27 +118,83 @@ sip2agent **没有 SIP 鉴权**。每一通电话都会消耗厂商额度,暴露
 - **防火墙**:SIP 端口和 RTP 端口段只对 PBX 开放。
 - **RTP 来源锁定**:每通电话只接收一个来源的 RTP(优先 SDP 里的地址,否则第一个有效来源),其他来源的包直接丢弃,防止往通话里注入音频。只有原来源静默 1 秒以上、新来源连续稳定发包时才会切换;re-INVITE 换了媒体地址会重新锁定。
 - **key 的存放**:用 `api_key_env` 从环境变量读取,不要写进配置文件提交到仓库。key 只会出现在 WebSocket 握手头里,不会进日志。
+- **管理接口**(`[admin] listen`,默认 `127.0.0.1:9060`):只监听本机回环地址,只能触发"重读本地配置文件 / 停服 / 查状态",不接收任何配置内容;带 `Origin` 头或 `Host` 不是 IP / localhost 的请求一律 403,网页无法借浏览器调用它。不需要时设为 `""` 关闭;改成非回环地址启动时会打 WARN。
 
-## 热加载配置
+## 运维命令
 
-改完配置文件后,给进程发 SIGHUP 即可生效,不用重启,也不会中断正在进行的通话:
+| 命令 | 作用 |
+|---|---|
+| `sip2agent -c config.toml` | 启动服务(也可写成 `sip2agent run -c config.toml`) |
+| `sip2agent -c config.toml --check` | 只校验配置 |
+| `sip2agent reload -c config.toml` | 热加载配置,不断线 |
+| `sip2agent status -c config.toml` | 查看运行状态和进行中的通话 |
+| `sip2agent stop -c config.toml [--drain] [--timeout 600]` | 停服;`--drain` 等通话打完再退出 |
+
+`reload` / `status` / `stop` 通过本机管理接口和运行中的服务通信:用 `-c` 指定的配置文件读出 `[admin] listen`(不写 `-c` 默认读当前目录的 `config.toml`;没有 `[admin]` 段就用默认的 `127.0.0.1:9060`),也可以用 `--address 127.0.0.1:9060` 直接指定。服务没在运行时命令以非 0 退出。Docker 里用 `docker exec`:
 
 ```bash
-kill -HUP <pid>                       # 直接运行时
-docker kill -s HUP sip2agent          # Docker 中运行时
+docker exec sip2agent sip2agent reload -c /app/conf/config.toml
+docker exec sip2agent sip2agent status -c /app/conf/config.toml
 ```
 
-- **先校验再生效**:新文件校验不通过(TOML 写错、字段非法等)时,日志打 ERROR,继续使用原配置。
+### 热加载配置
+
+改完配置文件后执行一次 `reload`,结果直接显示在终端:
+
+```text
+$ sip2agent reload -c config.toml
+✓ 配置已重新加载(只影响新呼入,进行中的通话不受影响)
+  改动: agents(+echo2,~echo)  sip.allow
+        (+ 新增  - 删除  ~ 修改)
+  agent: echo(9100), echo2(9200)
+  sip.allow: 2 条
+  ⚠ 以下字段需要重启才能生效,当前仍使用旧值: rtp.port_max
+```
+
+- **先校验再生效**:`reload` 先在本地校验文件,不通过就直接报错退出(退出码 1),不会通知服务;服务端加载时也会再校验一次,失败则继续使用原配置。
+- **服务读的是它自己的配置文件**:`reload` 只是通知服务"重读启动时 `-c` 指定的那个文件",不会把内容推过去,所以磁盘上的文件始终就是生效的配置。
 - **只影响新呼入**:正在进行的通话一直用它接通那一刻的配置,即使它的 agent 被删掉或改了也不受影响。
 - **可以热加载的**:`[[agent]]` 的全部字段(路由、提示词、音色、工具、webhook、key 等)、`sip.allow`、`rtp.timeout_secs`、`log.level`。设置了 `RUST_LOG` 环境变量时它优先,`log.level` 的修改不生效。
-- **需要重启的**:`sip.listen`、`sip.tcp`、`sip.external_ip`、`sip.user_agent`、`rtp.bind_ip`、`rtp.port_min`、`rtp.port_max`。热加载时这些字段的改动会被忽略(继续用启动时的值),并打一条 WARN 列出需要重启的字段;其余改动照常生效。
-- 每次加载成功都会打一条 INFO,列出当前 agent、`sip.allow` 条数和这次改动了哪些部分。
+- **需要重启的**:`sip.listen`、`sip.tcp`、`sip.external_ip`、`sip.user_agent`、`rtp.bind_ip`、`rtp.port_min`、`rtp.port_max`、`admin.listen`。这些字段的改动会被忽略(继续用启动时的值)并在结果里用 ⚠ 列出;其余改动照常生效。
+- **SIGHUP 等价**:`kill -HUP <pid>` / `docker kill -s HUP sip2agent` 走的是同一套加载逻辑,只是结果只写在日志里。systemd 可以写 `ExecReload=/usr/local/bin/sip2agent reload -c /etc/sip2agent/config.toml`(或 `ExecReload=/bin/kill -HUP $MAINPID`),然后 `systemctl reload sip2agent`。
 
-**Docker 单文件挂载的坑**:如果用 `-v $PWD/config.toml:/app/config.toml` 挂载单个文件,vim、多数 IDE、`sed -i` 这类"先写临时文件再改名"的保存方式会在宿主机上换掉文件的 inode,容器里看到的仍是**旧文件**,SIGHUP 读到的也是旧内容。请挂载目录(`-v $PWD/conf:/app/conf` 加 `-c /app/conf/config.toml`),见上面的[安装](#安装)示例。
+**Docker 单文件挂载的坑**:如果用 `-v $PWD/config.toml:/app/config.toml` 挂载单个文件,vim、多数 IDE、`sed -i` 这类"先写临时文件再改名"的保存方式会在宿主机上换掉文件的 inode,容器里看到的仍是**旧文件**,reload 读到的也是旧内容。请挂载目录(`-v $PWD/conf:/app/conf` 加 `-c /app/conf/config.toml`),见上面的[安装](#安装)示例。
+
+### 查看状态
+
+```text
+$ sip2agent status -c config.toml
+sip2agent 0.1.2 运行中(已运行 12秒)
+  配置文件: /app/conf/config.toml
+  状态: 正常接听
+  进行中的通话: 1
+    echo: 1
+```
+
+### 停服与升级不断线
+
+- `sip2agent stop`:和 SIGTERM / Ctrl-C 一样,立即给所有通话发 BYE 后退出。
+- `sip2agent stop --drain [--timeout 600]`:**排空**。不再接新电话(新的 INVITE 和 OPTIONS 探测都回 **503** + `Retry-After: 30`,PBX 的 dispatcher / 网关探测会据此把新呼叫切走),等进行中的通话自然结束后进程以 0 退出;超过 `--timeout` 秒(默认 600)还没打完的通话会被挂断。命令会一直显示剩余通话数,直到服务退出。排空过程中再执行一次不带 `--drain` 的 `stop`,会立即停服。
+
+```text
+$ sip2agent stop -c config.toml --drain
+✓ 已进入排空模式:新呼入回 503,1 通进行中的通话结束后自动退出(最长等待 600 秒,超时挂断剩余通话)
+  剩余 1 通通话…
+✓ 服务已退出
+```
+
+`docker stop` / `docker compose down` 发的是 SIGTERM,默认只等 10 秒,所有通话会被立即挂断。升级镜像时先排空:
+
+```bash
+docker compose pull
+docker compose exec sip2agent sip2agent stop -c /app/conf/config.toml --drain && docker compose up -d
+```
+
+两步写在一行里:容器如果配了 `restart: always / unless-stopped`,排空退出后 Docker 会马上用旧镜像把它拉起来,紧接着的 `up -d` 会换成新镜像。只有一个实例时,排空到新实例起来之间的新呼入会失败(503);要做到完全无感,需要两个实例,由 PBX 按 OPTIONS 探测在它们之间切换。
 
 ## 通话流程
 
-1. **路由**:收到 INVITE 后,先按 `sip.allow` 检查来源,不通过回 **403**;再按被叫号码匹配 `[[agent]].match`,都不中就找 `match = "*"`,仍没有回 **404**。
+1. **路由**:收到 INVITE 后,先按 `sip.allow` 检查来源,不通过回 **403**;正在排空(`stop --drain`)时回 **503**;再按被叫号码匹配 `[[agent]].match`,都不中就找 `match = "*"`,仍没有回 **404**。
 2. **选编码**:按 SDP offer 里的顺序取第一个 PCMA / PCMU,都没有回 **488**。
 3. **连模型**:回 100 Trying,然后**先连上厂商 WebSocket**,失败回 **503**。这样不会出现"电话接了但没人说话"。
 4. **接通**:回 200 OK,开始双向媒体。
@@ -172,6 +228,12 @@ docker kill -s HUP sip2agent          # Docker 中运行时
 ### `[log]`
 
 `level`:tracing EnvFilter 语法,默认 `info`,可热加载。`RUST_LOG` 环境变量优先(此时修改 `level` 不生效)。rsipstack 的 SIP 报文日志默认压到 warn,要看报文就写 `info,rsipstack=info`。
+
+### `[admin]`
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `listen` | `127.0.0.1:9060` | 本机管理接口地址(`reload` / `status` / `stop` 用),`""` 关闭。需要重启才能生效 |
 
 ### `[[agent]]`
 

@@ -23,8 +23,9 @@ use rsipstack::transaction::transaction::Transaction;
 use rsipstack::transaction::{Endpoint, TransactionReceiver};
 use rsipstack::transport::udp::UdpConnection;
 use rsipstack::transport::{TcpListenerConnection, TransportLayer};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -33,8 +34,13 @@ use tracing::{debug, error, info, warn};
 /// How long shutdown waits for active calls to send BYE.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
+/// `Retry-After` (seconds) on the 503s sent while draining.
+const DRAIN_RETRY_AFTER_SECS: u32 = 30;
+
 #[derive(Clone)]
 struct CallHandle {
+    /// Agent name (for per-agent counts in `/status`).
+    agent: String,
     cancel: CancellationToken,
     /// Hangup reason decided by the SIP side (caller BYE, CANCEL, shutdown...).
     remote_reason: Arc<Mutex<Option<&'static str>>>,
@@ -46,12 +52,91 @@ struct CallHandle {
 
 type Calls = Arc<Mutex<HashMap<String, CallHandle>>>;
 
+/// Runtime control shared with the admin API: call counts, drain, stop.
+pub struct ServerControl {
+    calls: Calls,
+    draining: AtomicBool,
+    /// Cancelled to stop the server (same graceful path as SIGTERM).
+    stop: CancellationToken,
+    started: Instant,
+}
+
+impl ServerControl {
+    /// Calls currently tracked (ringing or answered).
+    pub fn active_calls(&self) -> usize {
+        self.calls.lock().expect("calls lock").len()
+    }
+
+    /// Active calls per agent name.
+    pub fn per_agent(&self) -> BTreeMap<String, usize> {
+        let mut m = BTreeMap::new();
+        for h in self.calls.lock().expect("calls lock").values() {
+            *m.entry(h.agent.clone()).or_insert(0) += 1;
+        }
+        m
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    pub fn uptime(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// Graceful stop now: BYE every call, then [`SipServer::run`] returns.
+    pub fn stop_now(&self) {
+        info!(active_calls = self.active_calls(), "stop requested");
+        self.stop.cancel();
+    }
+
+    /// Stop taking new calls (INVITE / OPTIONS → 503) and stop once the
+    /// active calls reach 0; after `timeout` the remaining calls get BYE.
+    /// Returns false when already draining (the first timeout stays).
+    pub fn start_drain(self: &Arc<Self>, timeout: Duration) -> bool {
+        if self.draining.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        info!(
+            active_calls = self.active_calls(),
+            timeout_secs = timeout.as_secs(),
+            "draining: new calls get 503; stopping when active calls reach 0"
+        );
+        let this = self.clone();
+        tokio::spawn(async move {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if this.stop.is_cancelled() {
+                    return;
+                }
+                let active = this.active_calls();
+                if active == 0 {
+                    info!("drain complete: no active calls, stopping");
+                    this.stop.cancel();
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    warn!(
+                        active_calls = active,
+                        "drain timeout: hanging up the remaining calls"
+                    );
+                    this.stop.cancel();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+        true
+    }
+}
+
 pub struct SipServer {
     cfg: Arc<SharedConfig>,
     endpoint: Endpoint,
     dialog_layer: Arc<DialogLayer>,
     ports: Arc<PortAllocator>,
     calls: Calls,
+    control: Arc<ServerControl>,
     local_addr: SocketAddr,
     cancel: CancellationToken,
 }
@@ -116,15 +201,28 @@ impl SipServer {
             let allow: Vec<String> = cfg.sip.allow.iter().map(|n| n.to_string()).collect();
             info!(allow = %allow.join(","), "SIP source allowlist enabled");
         }
+        let calls: Calls = Arc::new(Mutex::new(HashMap::new()));
+        let control = Arc::new(ServerControl {
+            calls: calls.clone(),
+            draining: AtomicBool::new(false),
+            stop: CancellationToken::new(),
+            started: Instant::now(),
+        });
         Ok(Self {
             cfg: shared,
             endpoint,
             dialog_layer,
             ports,
-            calls: Arc::new(Mutex::new(HashMap::new())),
+            calls,
+            control,
             local_addr,
             cancel,
         })
+    }
+
+    /// Call counts / drain / stop handle (for the admin API).
+    pub fn control(&self) -> Arc<ServerControl> {
+        self.control.clone()
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -136,7 +234,8 @@ impl SipServer {
         self.cfg.clone()
     }
 
-    /// Run until `shutdown` fires; active calls get BYE before returning.
+    /// Run until `shutdown` fires (or the admin API stops / finishes draining);
+    /// active calls get BYE before returning.
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
         let incoming = self.endpoint.incoming_transactions()?;
         let (state_tx, state_rx) = self.dialog_layer.new_dialog_state_channel();
@@ -157,12 +256,16 @@ impl SipServer {
             dialog_layer: self.dialog_layer.clone(),
             ports: self.ports.clone(),
             calls: self.calls.clone(),
+            control: self.control.clone(),
             state_tx,
             sip_ip: self.local_addr.ip(),
         });
         let incoming_task = tokio::spawn(incoming_loop(incoming, ctx));
 
-        shutdown.cancelled().await;
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            _ = self.control.stop.cancelled() => {}
+        }
         info!("shutting down: hanging up active calls");
         {
             let calls = self.calls.lock().expect("calls lock");
@@ -192,6 +295,7 @@ struct InviteCtx {
     dialog_layer: Arc<DialogLayer>,
     ports: Arc<PortAllocator>,
     calls: Calls,
+    control: Arc<ServerControl>,
     state_tx: rsipstack::dialog::dialog::DialogStateSender,
     sip_ip: IpAddr,
 }
@@ -216,6 +320,26 @@ async fn incoming_loop(mut incoming: TransactionReceiver, ctx: Arc<InviteCtx>) {
                 });
                 continue;
             }
+        }
+        // Draining: refuse new calls and fail OPTIONS probes so PBX
+        // dispatchers / gateway pings route new calls elsewhere.
+        if !in_dialog
+            && matches!(method, Method::Invite | Method::Options)
+            && ctx.control.is_draining()
+        {
+            info!(%method, "draining: 503");
+            tokio::spawn(async move {
+                tx.reply_with(
+                    StatusCode::ServiceUnavailable,
+                    vec![Header::RetryAfter(
+                        DRAIN_RETRY_AFTER_SECS.to_string().into(),
+                    )],
+                    None,
+                )
+                .await
+                .ok();
+            });
+            continue;
         }
         if method == Method::Invite && !in_dialog {
             on_invite(&ctx, cfg, tx).await;
@@ -314,6 +438,7 @@ async fn on_invite(ctx: &Arc<InviteCtx>, cfg: Arc<Config>, mut tx: Transaction) 
         };
     let dialog_key = dialog.id().to_string();
     let handle = CallHandle {
+        agent: agent.name.clone(),
         cancel: CancellationToken::new(),
         remote_reason: Arc::new(Mutex::new(None)),
         answer_sdp: Arc::new(Mutex::new(None)),
@@ -402,6 +527,7 @@ async fn run_call(
     slots: CallHandle,
 ) {
     let CallHandle {
+        agent: _,
         cancel,
         remote_reason,
         answer_sdp: answer_slot,

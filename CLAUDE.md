@@ -24,9 +24,10 @@ SIP2AGENT_QWEN_LIVE=1 SIP2AGENT_LIVE_DIR=<wav目录> QWEN_URL=wss://... DASHSCOP
 
 | 路径 | 职责 |
 |---|---|
-| `src/main.rs` | 参数、日志(reload 句柄)、信号(SIGINT/SIGTERM 停机,SIGHUP 热加载)、启动 `SipServer` |
+| `src/main.rs` | 参数(`reload` / `stop` / `status` 子命令转给 `admin::cli_main`)、日志(reload 句柄)、信号(SIGINT/SIGTERM 停机,SIGHUP 热加载)、启动 `SipServer` + 管理接口 |
+| `src/admin.rs` | 本机管理接口(手写 HTTP/1.1,`POST /reload` `/stop`、`GET /status` `/health`;拒绝带 Origin / 非 IP Host 的请求)、`Reloader`(SIGHUP 与 `/reload` 共用、串行化)、CLI 客户端与中文输出 |
 | `src/config.rs` | `config.toml` 结构、校验、按被叫路由(精确 > `*`);`SharedConfig`(热加载原子替换)+ `merge_reload`(重启项保留旧值、报告改动) |
-| `src/sip.rs` | rsipstack UAS:INVITE/ACK/BYE/CANCEL、`sip.allow` 来源检查(403)、404/488/503、re-INVITE/UPDATE 回当前 SDP、状态循环、停机 BYE |
+| `src/sip.rs` | rsipstack UAS:INVITE/ACK/BYE/CANCEL、`sip.allow` 来源检查(403)、`ServerControl`(通话计数、排空:新 INVITE / OPTIONS 回 503 + Retry-After、停服)、404/488/503、re-INVITE/UPDATE 回当前 SDP、状态循环、停机 BYE |
 | `src/acl.rs` | `sip.allow` 的 IP/CIDR 解析与匹配(自写,不引依赖) |
 | `src/sdp.rs` | offer 解析(按 offer 顺序取首个 PCMA/PCMU)、answer 生成 |
 | `src/rtp.rs` | RTP 包、端口分配、对称 RTP 来源锁定(`Latch`:SDP 地址优先、锁定后丢弃其他来源、静默 1 s + 新来源连续 5 包才切换、re-INVITE 换地址重置)、收包重组 160 样本帧、`MediaPort` |
@@ -37,7 +38,7 @@ SIP2AGENT_QWEN_LIVE=1 SIP2AGENT_LIVE_DIR=<wav目录> QWEN_URL=wss://... DASHSCOP
 | `src/realtime/{doubao,qwen_omni,pcm_ws}.rs` | 适配器:编解码 + 协议状态机(无 IO / 计时),单测覆盖官方 / 实测事件样例 |
 | `src/webhook.rs` | 工具 webhook、通话结束 webhook |
 | `src/uac.rs` | 测试 UAC(examples / tests 共用):音调或按时间点播 wav 片段、录下行、wav 读写 |
-| `tests/` | `sip_calls.rs` 端到端 SIP;`vendor_bridges.rs` 豆包/Qwen mock 全流程;`qwen_live.rs` Qwen 真实联调(env 门控);`common/` mock WS/HTTP |
+| `tests/` | `sip_calls.rs` 端到端 SIP;`admin.rs` 管理接口(reload / status / 排空 / 超时 / 升级为立即停);`vendor_bridges.rs` 豆包/Qwen mock 全流程;`qwen_live.rs` Qwen 真实联调(env 门控);`common/` mock WS/HTTP |
 
 ## 硬规则
 
@@ -52,4 +53,5 @@ SIP2AGENT_QWEN_LIVE=1 SIP2AGENT_LIVE_DIR=<wav目录> QWEN_URL=wss://... DASHSCOP
 - API key 只能出现在 WS 握手头里,不进日志、不进 URL、`Debug` 输出要脱敏。
 - 新增 `[[agent]]` 字段要同步 `config.example.toml`(有单测保证它可解析)和 README 配置表。
 - **热加载**:每个请求在 `incoming_loop` 取一次 `SharedConfig::load()` 快照,通话全程只用 `CallInfo.cfg` / `agent` 快照,**通话路径里不许再读 live 配置**。新增任何配置字段都必须在 `merge_reload` 里归类为"可热加载"或"需重启(保留旧值)",并补 `reload_*` 测试;改了要同步 README「热加载配置」和 `config.example.toml` 头注释。
+- **管理接口只做三件事**:重读服务自己的配置文件、停服 / 排空、查状态;不要加"接收配置内容"之类的接口。响应要先写回客户端再触发停服(`After`),否则进程退出时客户端收不到结果。
 - 临时调试文件不要放进仓库。

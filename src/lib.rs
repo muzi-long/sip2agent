@@ -2,6 +2,7 @@
 //! models over WebSocket (Doubao Seeduplex, Qwen-Omni realtime, raw PCM WS).
 
 pub mod acl;
+pub mod admin;
 pub mod audio;
 pub mod call;
 pub mod config;

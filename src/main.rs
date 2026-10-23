@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use sip2agent::admin::{self, AdminState, LogApplier, Reloader};
 use sip2agent::config::{Config, SharedConfig};
 use sip2agent::sip::SipServer;
 use std::path::PathBuf;
@@ -6,33 +7,40 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry, reload};
-
-const USAGE: &str = "usage: sip2agent [-c|--config <config.toml>] [--check]";
+use tracing_subscriber::{EnvFilter, reload};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let rest = match args.first().map(String::as_str) {
+        Some(cmd @ ("reload" | "stop" | "status")) => {
+            std::process::exit(admin::cli_main(cmd, &args[1..]).await);
+        }
+        Some("run") => &args[1..],
+        _ => &args[..],
+    };
+
     let mut config_path = PathBuf::from("config.toml");
     let mut check_only = false;
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
             "-c" | "--config" => {
-                config_path = args
+                config_path = it
                     .next()
                     .map(PathBuf::from)
-                    .ok_or_else(|| anyhow::anyhow!(USAGE))?;
+                    .ok_or_else(|| anyhow::anyhow!(admin::CLI_USAGE))?;
             }
             "--check" => check_only = true,
             "-h" | "--help" => {
-                println!("{USAGE}");
+                println!("{}", admin::CLI_USAGE);
                 return Ok(());
             }
             "-V" | "--version" => {
                 println!("sip2agent {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
-            other => anyhow::bail!("unknown argument '{other}'\n{USAGE}"),
+            other => anyhow::bail!("unknown argument '{other}'\n{}", admin::CLI_USAGE),
         }
     }
 
@@ -60,14 +68,46 @@ async fn main() -> Result<()> {
     }
 
     sip2agent::install_crypto_provider();
+    let admin_addr = cfg.admin.addr()?;
     let shared = Arc::new(SharedConfig::new(cfg));
     let server = SipServer::bind_shared(shared.clone()).await?;
-    tokio::spawn(reload_on_sighup(
-        shared,
-        config_path,
-        filter_handle,
-        rust_log,
-    ));
+
+    let on_log: LogApplier = Arc::new(move |log| {
+        if rust_log {
+            tracing::info!(
+                "log.level changed but RUST_LOG is set and takes precedence; log filter unchanged"
+            );
+            return;
+        }
+        match EnvFilter::try_new(log.directive()) {
+            Ok(f) => match filter_handle.reload(f) {
+                Ok(()) => tracing::info!(level = %log.level, "log level updated"),
+                Err(e) => tracing::warn!(error = %e, "log filter reload failed"),
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, level = %log.level, "invalid log.level; log filter unchanged")
+            }
+        }
+    });
+    let path_abs = std::fs::canonicalize(&config_path).unwrap_or(config_path);
+    let reloader = Arc::new(Reloader::new(shared, path_abs, Some(on_log)));
+    tokio::spawn(reload_on_sighup(reloader.clone()));
+
+    if let Some(addr) = admin_addr {
+        let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
+            format!("bind admin API {addr} (set [admin] listen = \"\" to disable)")
+        })?;
+        if !addr.ip().is_loopback() {
+            tracing::warn!(%addr, "admin API is not on a loopback address: anyone who can reach it can reload / stop the server");
+        }
+        tracing::info!(%addr, "admin API listening (sip2agent reload | stop | status)");
+        let state = Arc::new(AdminState {
+            reloader,
+            control: server.control(),
+        });
+        tokio::spawn(admin::serve(listener, state));
+    }
+
     let shutdown = CancellationToken::new();
     {
         let shutdown = shutdown.clone();
@@ -95,61 +135,19 @@ async fn wait_for_signal() {
     }
 }
 
-/// SIGHUP → re-read the config file. Invalid files are rejected (running
-/// config kept); valid ones apply to new calls only.
+/// SIGHUP → same reload as `sip2agent reload`. Invalid files are rejected
+/// (running config kept); valid ones apply to new calls only.
 #[cfg(unix)]
-async fn reload_on_sighup(
-    shared: Arc<SharedConfig>,
-    path: PathBuf,
-    filter: reload::Handle<EnvFilter, Registry>,
-    rust_log: bool,
-) {
+async fn reload_on_sighup(reloader: Arc<Reloader>) {
     use tokio::signal::unix::{SignalKind, signal};
     let Ok(mut hup) = signal(SignalKind::hangup()) else {
         tracing::warn!("cannot install SIGHUP handler: config reload disabled");
         return;
     };
     while hup.recv().await.is_some() {
-        tracing::info!(path = %path.display(), "SIGHUP: reloading config");
-        let report = match shared.reload_file(&path) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(
-                    error = format!("{e:#}"),
-                    "config reload failed; keeping the running config"
-                );
-                continue;
-            }
-        };
-        let Some(log) = report.log_level else {
-            continue;
-        };
-        if rust_log {
-            tracing::info!(
-                "log.level changed but RUST_LOG is set and takes precedence; log filter unchanged"
-            );
-            continue;
-        }
-        match EnvFilter::try_new(log.directive()) {
-            Ok(f) => {
-                if let Err(e) = filter.reload(f) {
-                    tracing::warn!(error = %e, "log filter reload failed");
-                } else {
-                    tracing::info!(level = %log.level, "log level updated");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, level = %log.level, "invalid log.level; log filter unchanged")
-            }
-        }
+        reloader.reload("SIGHUP").await;
     }
 }
 
 #[cfg(not(unix))]
-async fn reload_on_sighup(
-    _shared: Arc<SharedConfig>,
-    _path: PathBuf,
-    _filter: reload::Handle<EnvFilter, Registry>,
-    _rust_log: bool,
-) {
-}
+async fn reload_on_sighup(_reloader: Arc<Reloader>) {}

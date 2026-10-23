@@ -1,8 +1,9 @@
 # sip2agent 配置示例。复制为 config.toml 后按需修改。
 # 启动:sip2agent -c config.toml      校验:sip2agent -c config.toml --check
-# 热加载:改完后 kill -HUP <pid>(或 docker kill -s HUP sip2agent),只影响新呼入。
+# 热加载:改完后 sip2agent reload -c config.toml(或 kill -HUP <pid>),只影响新呼入。
 #   可热加载:[[agent]] 全部字段、sip.allow、rtp.timeout_secs、log.level
-#   需要重启:sip.listen / tcp / external_ip / user_agent、rtp.bind_ip / port_min / port_max
+#   需要重启:sip.listen / tcp / external_ip / user_agent、rtp.bind_ip / port_min / port_max、admin.listen
+# 状态 / 停服:sip2agent status -c config.toml、sip2agent stop -c config.toml [--drain]
 
 [sip]
 # SIP 监听地址(UDP 必开)
@@ -27,6 +28,11 @@ timeout_secs = 30
 [log]
 # tracing EnvFilter 语法;RUST_LOG 环境变量优先
 level = "info"
+
+[admin]
+# 本机管理接口(sip2agent reload / status / stop 用),"" = 关闭。
+# 只建议监听回环地址;改成其他地址启动时会打 WARN。
+listen = "127.0.0.1:9060"
 
 # ---------------------------------------------------------------------------
 # 路由:按被叫号码(Request-URI user)精确匹配 `match`,都不中再用 `match = "*"`;
