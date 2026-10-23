@@ -33,3 +33,70 @@ main:
             - echo "build and push $IMAGE:$TAG"
             - docker buildx build --platform linux/amd64 --progress=plain --cache-from type=registry,ref=$IMAGE:buildcache --cache-to type=registry,ref=$IMAGE:buildcache,mode=max,image-manifest=true -t "$IMAGE:$TAG" -t "$IMAGE:latest" --push .
             - echo "pushed $IMAGE:$TAG"
+
+# 发版:tag v* → linux x86_64 / aarch64(交叉编译)二进制 + cnb Release 附件 + 版本号镜像。
+# 与 GitHub release.yml 产物同名;macOS 只在 GitHub 出。
+# 补发历史 tag(config 须走 --data 的 JSON,--config 会把 \n 转义吃掉):
+#   cnb build start-build --repo <仓库> --data "$(python3 -c "import json;print(json.dumps({'tag':'vX.Y.Z','event':'api_trigger_release','config':open('.cnb.yml').read()}))")"
+.release: &release
+  - name: release-sip2agent
+    runner:
+      tags: cnb:arch:amd64
+    services:
+      - docker
+    docker:
+      volumes:
+        - /usr/local/cargo/registry
+    env:
+      IMAGE: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}
+    stages:
+      - name: build-binaries
+        image: rust:1.92-bookworm
+        script:
+          - printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' > /usr/local/cargo/config.toml
+          - apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          - rustup target add aarch64-unknown-linux-gnu
+          - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+          - |
+            set -e
+            mkdir -p dist
+            for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+              cargo build --release --locked --bin sip2agent --target $t
+              name=sip2agent-${CNB_BRANCH}-$t
+              mkdir -p dist/$name
+              cp target/$t/release/sip2agent config.example.toml README.md LICENSE dist/$name/
+              tar -C dist -czf dist/$name.tar.gz $name
+              (cd dist && sha256sum $name.tar.gz > $name.tar.gz.sha256)
+              rm -rf dist/$name
+            done
+            ls -lh dist
+
+      - name: changelog
+        image: cnbcool/changelog
+        settings:
+          latestChangeLogTarget: LATEST_CHANGELOG.md
+
+      - name: create-release
+        type: git:release
+        options:
+          tag: ${CNB_BRANCH}
+          descriptionFromFile: LATEST_CHANGELOG.md
+          latest: true
+
+      - name: upload-attachments
+        image: cnbcool/attachments:latest
+        settings:
+          tag: ${CNB_BRANCH}
+          attachments:
+            - "dist/*.tar.gz"
+            - "dist/*.sha256"
+
+      - name: push-version-image
+        script:
+          - VER=${CNB_BRANCH#v}
+          - docker buildx build --platform linux/amd64 --progress=plain --cache-from type=registry,ref=$IMAGE:buildcache -t "$IMAGE:$VER" --push .
+          - echo "pushed $IMAGE:$VER"
+
+"v*":
+  tag_push: *release
+  api_trigger_release: *release
