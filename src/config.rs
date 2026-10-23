@@ -202,9 +202,6 @@ pub struct AgentConfig {
     /// Opening line spoken when the call is answered.
     #[serde(default)]
     pub greeting: Option<String>,
-    /// PCM sample rate for pcm_ws (default 8000).
-    #[serde(default)]
-    pub sample_rate: Option<u32>,
     /// Extra static WebSocket upgrade headers.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
@@ -212,12 +209,6 @@ pub struct AgentConfig {
     pub api_key: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
-    /// qwen_omni turn detection: `server_vad` (default) or `semantic_vad`.
-    #[serde(default)]
-    pub turn_detection: Option<String>,
-    /// doubao: top-level `extension` passthrough object (asr/tts/dialog).
-    #[serde(default)]
-    pub extension: Option<serde_json::Value>,
 
     #[serde(default)]
     pub tool_webhook: Option<String>,
@@ -288,6 +279,21 @@ fn default_tool_params() -> serde_json::Value {
     serde_json::json!({"type": "object", "properties": {}})
 }
 
+/// Vendor-only knobs removed in 0.1.4; the adapters now fix these values.
+const REMOVED_AGENT_FIELDS: &[(&str, &str)] = &[
+    ("turn_detection", "qwen_omni 固定 server_vad"),
+    ("extension", "doubao 不再透传 extension"),
+    ("sample_rate", "pcm_ws 固定 8000 Hz"),
+];
+
+fn removed_field_hint(err: &str) -> String {
+    REMOVED_AGENT_FIELDS
+        .iter()
+        .find(|(f, _)| err.contains(&format!("unknown field `{f}`")))
+        .map(|(f, why)| format!("\n提示:`{f}` 已在 0.1.4 移除({why}),请从配置中删掉该行"))
+        .unwrap_or_default()
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -296,7 +302,9 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let cfg: Config = toml::from_str(text).context("parse config")?;
+        let cfg: Config = toml::from_str(text)
+            .map_err(|e| anyhow::anyhow!("{}{}", e, removed_field_hint(&e.to_string())))
+            .context("parse config")?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -323,11 +331,6 @@ impl Config {
                 ProviderKind::PcmWs => {
                     if a.url.as_deref().unwrap_or("").is_empty() {
                         bail!("agent '{}': provider pcm_ws requires `url`", a.name);
-                    }
-                    if let Some(r) = a.sample_rate
-                        && !(8000..=48000).contains(&r)
-                    {
-                        bail!("agent '{}': sample_rate {r} out of range", a.name);
                     }
                 }
                 ProviderKind::QwenOmni => {
@@ -533,6 +536,31 @@ parameters = { type = "object", properties = { order_id = { type = "string" } },
         assert_eq!(q.tools.len(), 1);
         assert_eq!(q.tools[0].parameters["required"][0], "order_id");
         assert_eq!(q.timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn removed_vendor_fields_are_rejected_with_hint() {
+        for (field, value) in [
+            ("turn_detection", "'semantic_vad'"),
+            ("extension", "{dialog={}}"),
+            ("sample_rate", "16000"),
+        ] {
+            let text = format!(
+                "[[agent]]\nname='a'\nmatch='*'\nprovider='pcm_ws'\nurl='ws://h'\n{field}={value}\n"
+            );
+            let err = format!("{:#}", Config::parse(&text).unwrap_err());
+            assert!(err.contains(&format!("`{field}` 已在 0.1.4 移除")), "{err}");
+        }
+        // Other unknown fields get the plain error only.
+        let err = format!(
+            "{:#}",
+            Config::parse("[[agent]]\nname='a'\nmatch='*'\nprovider='echo'\nbogus=1\n")
+                .unwrap_err()
+        );
+        assert!(
+            err.contains("unknown field `bogus`") && !err.contains("提示"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@
   - 输出格式 **`pcm_s16le`** / 24000(`pcm` 是 float32,不要用);
   - `audio.output.voice` 必填;
   - 工具是扁平结构 `{type:"function", name, description, parameters}`;
-  - `extension` 放在事件顶层,和 `session` 并列,与官方示例一致。
+  - 不发 `extension`(厂商专有参数不开放配置)。
 - **采样率**:SIP 8k 升到 16k 上行,24k 降到 8k 下行(`src/audio/resample.rs`)。
 - **上行节奏**:严格 20 ms 一包(640 字节),按实时节奏发送,**静音也要发**。服务端靠上行保活,节奏偏离会报错。
 - **开场白**:`speech_text_buffer.commit {text}`。
@@ -44,7 +44,7 @@
   1. 用 `turn_detection: null`(手动模式)建会话,instructions 末尾追加"下一句必须一字不差地说……,你收到的是静音"的原话指令;
   2. 追加 300 ms 静音,再发 `input_audio_buffer.commit`;
   3. 收到 `input_audio_buffer.committed` 后发 `response.create`;
-  4. 该回复的 `response.done` 到达后,发 `session.update` 切回 `server_vad` 并还原 instructions;
+  4. 该回复的 `response.done` 到达后,发 `session.update` 切回 `server_vad` 并还原 instructions(开场白之外固定用 `server_vad`,不可配置);
   5. 收到 `session.updated` 后,放行期间暂存的主叫音频。
 
   注意两点:
@@ -65,7 +65,7 @@
 
 ## 通用 PCM WebSocket(`pcm_ws`)
 
-- **音频**:双向二进制帧,无头 PCM16 小端单声道,采样率为配置里的 `sample_rate`(默认 8000,不重采样)。上行每 20 ms 一帧,含静音。
+- **音频**:双向二进制帧,无头 PCM16 小端单声道,采样率固定 8000 Hz,和 SIP 同频、不重采样,不可配置。上行每 20 ms 一帧,含静音。
 - **握手头**:配置里的 `headers` 原样带上;配了 `api_key` 时追加 `Authorization: Bearer <key>`。
 - **控制消息**:
   - 服务端文本帧 `{"type":"clear"}`:打断,清空播放缓冲;

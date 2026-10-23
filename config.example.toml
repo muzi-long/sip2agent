@@ -56,7 +56,6 @@ instructions = "你是某某公司的电话客服,回答简洁礼貌。"
 greeting = "您好,这里是某某客服,请问有什么可以帮您?"
 # model = "1.2.6.1"                     # 默认即全双工版本固定值
 # url = "wss://openspeech.bytedance.com/api/v3/duplex/realtime/dialogue"
-# extension = { dialog = { extra = { strict_audit = true } } }   # 原样透传到 session.create 顶层 extension
 tool_webhook = "http://127.0.0.1:8080/sip2agent/tool"
 call_end_webhook = "http://127.0.0.1:8080/sip2agent/call-end"
 timeout_ms = 10000
@@ -77,7 +76,6 @@ url = "wss://ws-xxxxxxxx.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime"   # �
 voice = "Tina"
 instructions = "你是电话客服,回答简洁。"
 greeting = "您好,请问有什么可以帮您?"
-# turn_detection = "semantic_vad"       # 默认 server_vad
 call_end_webhook = "http://127.0.0.1:8080/sip2agent/call-end"
 
 # 通用裸 PCM WebSocket(自建模型服务)
@@ -86,6 +84,5 @@ name = "selfhosted"
 match = "*"
 provider = "pcm_ws"
 url = "ws://127.0.0.1:9100/realtime"
-sample_rate = 8000                      # 默认 8000(不重采样)
 headers = { X-Tenant = "demo" }
 # api_key = "..."                       # 配了就加 Authorization: Bearer

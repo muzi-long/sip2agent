@@ -34,6 +34,8 @@ pub const DEFAULT_MODEL: &str = "qwen3.8-omni-flash-realtime";
 pub const DEFAULT_VOICE: &str = "Tina";
 pub const SAMPLE_RATE: u32 = 8000;
 pub const ASR_MODEL: &str = "qwen3-asr-flash-realtime";
+/// Turn detection outside the greeting phase (fixed, not configurable).
+pub const TURN_DETECTION: &str = "server_vad";
 /// Silence committed as the (empty) caller turn that the greeting answers.
 const GREETING_SILENCE_SAMPLES: usize = SAMPLE_RATE as usize * 300 / 1000;
 
@@ -63,7 +65,6 @@ pub struct QwenOmni {
     voice: String,
     instructions: Option<String>,
     greeting: Option<String>,
-    turn_detection: String,
     tools: Vec<crate::config::ToolDef>,
     phase: Phase,
     pending: Vec<UplinkMessage>,
@@ -99,10 +100,6 @@ impl QwenOmni {
                 .unwrap_or_else(|| DEFAULT_VOICE.to_string()),
             instructions: agent.instructions.clone().filter(|s| !s.is_empty()),
             greeting: agent.greeting.clone().filter(|s| !s.is_empty()),
-            turn_detection: agent
-                .turn_detection
-                .clone()
-                .unwrap_or_else(|| "server_vad".to_string()),
             tools: agent.tools.clone(),
             phase: Phase::Init,
             pending: Vec::new(),
@@ -122,7 +119,7 @@ impl QwenOmni {
             },
             "turn_detection": match greeting {
                 Some(_) => Value::Null,
-                None => json!({"type": self.turn_detection}),
+                None => json!({"type": TURN_DETECTION}),
             },
             "input_audio_transcription": {"model": ASR_MODEL},
         });
@@ -548,11 +545,11 @@ mod tests {
 
     #[test]
     fn no_greeting_goes_live() {
-        let mut p = proto("turn_detection='semantic_vad'");
+        let mut p = proto("");
         let v = json_of(&p.session_open()[0]);
         assert!(v["session"].get("tools").is_none());
         assert!(v["session"].get("instructions").is_none());
-        assert_eq!(v["session"]["turn_detection"]["type"], "semantic_vad");
+        assert_eq!(v["session"]["turn_detection"]["type"], "server_vad");
         assert_eq!(
             p.decode_text(r#"{"type":"session.updated"}"#),
             vec![DownlinkEvent::SessionReady]

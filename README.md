@@ -248,9 +248,6 @@ docker compose exec sip2agent sip2agent stop -c /app/conf/config.toml --drain &&
 | `voice` | qwen / doubao(必填) | Qwen 默认 `Tina` |
 | `instructions` | qwen / doubao | 系统提示词 |
 | `greeting` | qwen / doubao | 开场白,接通后一字不差地先说 |
-| `turn_detection` | qwen | `server_vad`(默认)或 `semantic_vad` |
-| `extension` | doubao | 原样透传给豆包的 `extension`(asr / tts / dialog 高级参数) |
-| `sample_rate` | pcm_ws | 默认 8000 |
 | `headers` | 全部 | 额外的 WebSocket 握手头 |
 | `tools` | qwen / doubao | 函数工具列表 `[[agent.tools]]`,字段为 `name`、`description`、`parameters`(JSON Schema) |
 | `tool_webhook` | qwen / doubao | 工具调用的转发地址 |
@@ -329,7 +326,7 @@ Content-Type: application/json
 ### 通用 PCM WebSocket(`pcm_ws`)
 
 适合对接自建的语音模型服务:
-- **音频**:双向二进制帧,无头 PCM16 小端单声道,采样率默认 8000。
+- **音频**:双向二进制帧,无头 PCM16 小端单声道,采样率固定 8000(和 SIP 同频)。
 - **控制消息**:服务端发 `{"type":"clear"}` 表示打断,发 `{"type":"hangup"}` 表示挂机。
 - **参考实现**:`examples/pcm_ws_echo.rs`。
 

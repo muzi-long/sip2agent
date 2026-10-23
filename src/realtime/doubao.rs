@@ -4,8 +4,8 @@
 //! official python3.7 duplex demo (2026-10):
 //! - URL `wss://openspeech.bytedance.com/api/v3/duplex/realtime/dialogue`,
 //!   header `X-Api-Key`. Pure JSON text frames routed by `type`.
-//! - `session.create` with `session.model = "1.2.6.1"`; `extension` sits at
-//!   the top level of the event (sibling of `session`), as in the demo.
+//! - `session.create` with `session.model = "1.2.6.1"`; no `extension` is
+//!   sent (vendor-specific knobs are not configurable).
 //! - Input `pcm` 16 kHz int16; output `pcm_s16le` 24 kHz (`pcm` would be float32).
 //! - Audio must be sent at real-time pace in 20 ms packets (640 bytes), also
 //!   during silence (keepalive) — the bridge loop guarantees that.
@@ -35,7 +35,6 @@ pub struct Doubao {
     instructions: Option<String>,
     greeting: Option<String>,
     tools: Vec<crate::config::ToolDef>,
-    extension: Option<Value>,
 }
 
 impl Doubao {
@@ -57,7 +56,6 @@ impl Doubao {
             instructions: agent.instructions.clone().filter(|s| !s.is_empty()),
             greeting: agent.greeting.clone().filter(|s| !s.is_empty()),
             tools: agent.tools.clone(),
-            extension: agent.extension.clone(),
         }
     }
 }
@@ -113,11 +111,9 @@ impl RealtimeProtocol for Doubao {
                     .collect(),
             );
         }
-        let mut ev = json!({"type": "session.create", "session": session});
-        if let Some(ext) = &self.extension {
-            ev["extension"] = ext.clone();
-        }
-        vec![UplinkMessage::json(ev)]
+        vec![UplinkMessage::json(
+            json!({"type": "session.create", "session": session}),
+        )]
     }
 
     fn greeting(&mut self) -> Vec<UplinkMessage> {
@@ -277,7 +273,7 @@ mod tests {
     #[test]
     fn session_create_shape() {
         let p = proto(
-            "instructions='你是客服'\nextension={dialog={extra={enable_music=false}}}\n[[agent.tools]]\nname='get_weather'\ndescription='查天气'\nparameters={type='object',properties={city={type='string'}},required=['city']}\n",
+            "instructions='你是客服'\n[[agent.tools]]\nname='get_weather'\ndescription='查天气'\nparameters={type='object',properties={city={type='string'}},required=['city']}\n",
         );
         let v = json_of(&p.session_open()[0]);
         assert_eq!(v["type"], "session.create");
@@ -302,7 +298,7 @@ mod tests {
                 "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
             })
         );
-        assert_eq!(v["extension"]["dialog"]["extra"]["enable_music"], false);
+        assert!(v.get("extension").is_none());
         assert!(s.get("id").is_none());
     }
 

@@ -1,7 +1,7 @@
 //! Generic raw-PCM WebSocket protocol (same wire as rustpbx `pcm.rs`, no DTMF).
 //!
-//! - Uplink: binary frames, headerless PCM16-LE mono at `sample_rate`
-//!   (default 8000 → no resampling), one frame per 20 ms including silence.
+//! - Uplink: binary frames, headerless PCM16-LE mono, fixed 8000 Hz (same as
+//!   SIP, no resampling), one frame per 20 ms including silence.
 //! - Downlink: binary frames, same encoding.
 //! - Text `{"type":"clear"}` from the server = barge-in (clear playout).
 //! - Text `{"type":"hangup"}` from the server = hang up the call.
@@ -10,7 +10,8 @@ use super::{DownlinkEvent, RealtimeProtocol, ToolOutput, UplinkMessage};
 use crate::audio::{bytes_to_pcm, pcm_to_bytes};
 use crate::config::AgentConfig;
 
-pub const DEFAULT_RATE: u32 = 8000;
+/// Fixed wire sample rate (not configurable).
+pub const RATE: u32 = 8000;
 
 pub struct PcmWs {
     url: String,
@@ -30,7 +31,7 @@ impl PcmWs {
         }
         Self {
             url: agent.url.clone().unwrap_or_default(),
-            rate: agent.sample_rate.unwrap_or(DEFAULT_RATE),
+            rate: RATE,
             headers,
         }
     }
@@ -140,11 +141,8 @@ mod tests {
 
     #[test]
     fn headers_rate_and_auth() {
-        let p = PcmWs::new(
-            &agent("sample_rate=16000\nheaders={X-Custom='v'}\n"),
-            Some("k1".into()),
-        );
-        assert_eq!(p.input_rate(), 16000);
+        let p = PcmWs::new(&agent("headers={X-Custom='v'}\n"), Some("k1".into()));
+        assert_eq!(p.input_rate(), 8000);
         let h = p.headers();
         assert!(h.contains(&("X-Custom".into(), "v".into())));
         assert!(h.contains(&("Authorization".into(), "Bearer k1".into())));

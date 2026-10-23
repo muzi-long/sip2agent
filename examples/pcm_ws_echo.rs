@@ -2,8 +2,7 @@
 //!
 //! cargo run --example pcm_ws_echo -- --listen 127.0.0.1:9100 [--hangup-after-secs 5]
 //!
-//! Wire: binary PCM16-LE mono both ways (rate = agent `sample_rate`, default
-//! 8000); text `{"type":"clear"}` = barge-in, `{"type":"hangup"}` = hang up.
+//! Wire: binary PCM16-LE mono both ways at 8000 Hz; text `{"type":"clear"}` = barge-in, `{"type":"hangup"}` = hang up.
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
